@@ -43,7 +43,10 @@ its push; the separate fork PR workflow checks human-submitted changes.
 
 On a newly created fork, enable GitHub Actions and explicitly enable the
 scheduled workflow in the fork's **Actions** tab. After enabling, run it
-manually once and confirm a green result. You can also use the `Fork review
+manually once and confirm a green result. When upstream has not changed, a
+manual run also performs a **dry-run atomic push** with the scoped Actions token
+to verify that future automatic pushes will be authorized, without changing
+either branch. You can also use the `Fork review
 checks` workflow to test a pull request. Leave the repository's default
 `GITHUB_TOKEN` read-only; each job specifies the narrow permissions it needs.
 

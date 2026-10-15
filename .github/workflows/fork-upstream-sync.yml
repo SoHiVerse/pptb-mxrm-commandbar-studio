@@ -101,10 +101,12 @@ jobs:
           fi
 
       - name: Recheck remote tips and push both safe updates atomically
-        if: steps.merge.outputs.fork_changed == 'true' || steps.merge.outputs.feature_changed == 'true'
+        if: steps.merge.outputs.fork_changed == 'true' || steps.merge.outputs.feature_changed == 'true' || github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          FORK_CHANGED: ${{ steps.merge.outputs.fork_changed }}
+          FEATURE_CHANGED: ${{ steps.merge.outputs.feature_changed }}
           EXPECTED_FORK: ${{ steps.merge.outputs.fork_sha }}
           EXPECTED_FEATURE: ${{ steps.merge.outputs.feature_sha }}
           EXPECTED_UPSTREAM: ${{ steps.merge.outputs.upstream_sha }}
@@ -123,8 +125,17 @@ jobs:
           esac
           ASKPASS
           chmod 700 "$RUNNER_TEMP/fork-askpass"
-          GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$RUNNER_TEMP/fork-askpass" \
-            git push --atomic origin \
-              sync-fork-dev:refs/heads/dev \
-              sync-feature:refs/heads/feat/onpremises-v91-native
+          # A manual no-op run also verifies the GitHub token's push rights
+          # and atomic-push capability without moving either branch ref.
+          if [[ "$FORK_CHANGED" == 'false' && "$FEATURE_CHANGED" == 'false' ]]; then
+            GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$RUNNER_TEMP/fork-askpass" \
+              git push --atomic --dry-run origin \
+                sync-fork-dev:refs/heads/dev \
+                sync-feature:refs/heads/feat/onpremises-v91-native
+          else
+            GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$RUNNER_TEMP/fork-askpass" \
+              git push --atomic origin \
+                sync-fork-dev:refs/heads/dev \
+                sync-feature:refs/heads/feat/onpremises-v91-native
+          fi
           rm -f "$RUNNER_TEMP/fork-askpass"

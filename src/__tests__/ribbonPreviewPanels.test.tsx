@@ -8,6 +8,7 @@ import { useUIStore } from "@/store/uiStore";
 import type { RibbonWorkspace, RibbonSourceSnapshot } from "@/types/workspace";
 
 const editorActions = vi.hoisted(() => ({ format: vi.fn(), updateDiff: vi.fn(), copyFromHost: vi.fn() }));
+const modelLifetime = vi.hoisted(() => ({ originalDispose: vi.fn(), modifiedDispose: vi.fn(), onDispose: null as null | (() => void) }));
 
 vi.mock("@/services/dataverse/webResourceService", () => ({ loadWebResources: () => Promise.resolve([]) }));
 vi.mock("@/utils/monacoCompletions", () => ({
@@ -23,10 +24,13 @@ vi.mock("@/components/shared/MonacoEditor", () => ({
 	),
 }));
 vi.mock("@monaco-editor/react", () => ({
-	DiffEditor: ({ original, modified, theme, onMount }: { original: string; modified: string; theme: string; onMount?: (editor: unknown) => void }) => (
-		<div data-testid="diff-editor" data-theme={theme}>
+	DiffEditor: ({ original, modified, theme, onMount, keepCurrentOriginalModel, keepCurrentModifiedModel }: { original: string; modified: string; theme: string; onMount?: (editor: unknown) => void; keepCurrentOriginalModel?: boolean; keepCurrentModifiedModel?: boolean }) => (
+		<div data-testid="diff-editor" data-theme={theme} data-keep-original={String(keepCurrentOriginalModel)} data-keep-modified={String(keepCurrentModifiedModel)}>
 			<output data-testid="original-xml">{original}</output><output data-testid="merged-xml">{modified}</output>
-			<button onClick={() => onMount?.({ updateOptions: editorActions.updateDiff })} data-testid="mount-diff-editor">Mount diff editor</button>
+			<button onClick={() => onMount?.({ updateOptions: editorActions.updateDiff,
+				getModel: () => ({ original: { isDisposed: () => false, dispose: modelLifetime.originalDispose }, modified: { isDisposed: () => false, dispose: modelLifetime.modifiedDispose } }),
+				onDidDispose: (listener: () => void) => { modelLifetime.onDispose = listener; return { dispose: vi.fn() }; },
+			})} data-testid="mount-diff-editor">Mount diff editor</button>
 		</div>
 		),
 }));
@@ -62,7 +66,8 @@ function seed(source: boolean) {
 	let originalClipboard: PropertyDescriptor | undefined;
 		beforeEach(() => {
 			editorActions.format.mockClear();
-			editorActions.updateDiff.mockClear();
+				editorActions.updateDiff.mockClear();
+				modelLifetime.originalDispose.mockClear(); modelLifetime.modifiedDispose.mockClear(); modelLifetime.onDispose = null;
 		originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
 		vi.stubGlobal("ResizeObserver", class {
 			observe() { /* jsdom has no layout */ }
@@ -157,7 +162,32 @@ function seed(source: boolean) {
 			expect(screen.getAllByRole("tab")).toHaveLength(4);
 		});
 
-	it("XmlDrawer copies through toolbox utilities and catches clipboard failure without false success", async () => {
+		it("releases diff models after the widget is disposed instead of before it", async () => {
+			renderPanel(<DiffViewer />);
+			const editor = await screen.findByTestId('diff-editor');
+			expect(editor.dataset.keepOriginal).toBe('true');
+			expect(editor.dataset.keepModified).toBe('true');
+			fireEvent.click(screen.getByTestId('mount-diff-editor'));
+			expect(modelLifetime.onDispose).not.toBeNull();
+			modelLifetime.onDispose!();
+			expect(modelLifetime.originalDispose).not.toHaveBeenCalled();
+			await Promise.resolve();
+			expect(modelLifetime.originalDispose).toHaveBeenCalledTimes(1);
+			expect(modelLifetime.modifiedDispose).toHaveBeenCalledTimes(1);
+		});
+
+		it("shows no diff for an untouched workspace with no application customization layer", async () => {
+			act(() => {
+				useRibbonStore.getState().undo();
+				useRibbonStore.setState({ sourceSnapshot: { ...useRibbonStore.getState().sourceSnapshot!, applicationRibbonXml: null } });
+			});
+			renderPanel(<DiffViewer />);
+			await screen.findByTestId('diff-editor');
+			expect(screen.getByTestId('original-xml').textContent).toBe(screen.getByTestId('merged-xml').textContent);
+			expect(screen.queryByText(/Application.*unavailable/)).toBeNull();
+		});
+
+		it("XmlDrawer copies through toolbox utilities and catches clipboard failure without false success", async () => {
 		const copyToClipboard = vi.fn().mockRejectedValue(new Error("Clipboard denied"));
 		vi.stubGlobal("toolboxAPI", { utils: { copyToClipboard } });
 		Object.defineProperty(navigator, "clipboard", { value: { writeText: vi.fn().mockRejectedValue(new Error("Denied")) }, configurable: true });

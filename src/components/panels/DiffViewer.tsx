@@ -87,8 +87,9 @@ function buildDiffDocuments(current: RibbonWorkspace, baseline: RibbonWorkspace,
 		const title = scope === "entity" ? "Entity (Home Grid + Sub Grid + Form)" : "Application";
 		try {
 			const preview = buildRibbonPreview({ current, baseline, sourceSnapshot }, scope);
-			originals.push(`<!-- ${title}: original exported unmanaged source -->\n${preview.originalXml}`);
-			modified.push(`<!-- ${title}: complete preserved target -->\n${preview.mergedXml}`);
+				// Identical headings must not manufacture changes in a no-edit comparison.
+				originals.push(`<!-- ${title}: unmanaged ribbon -->\n${preview.originalXml}`);
+				modified.push(`<!-- ${title}: unmanaged ribbon -->\n${preview.mergedXml}`);
 		} catch (cause) {
 			const reason = cause instanceof Error ? cause.message : String(cause);
 			errors.push(`${title}: ${reason}`);
@@ -154,8 +155,19 @@ export const DiffViewer: React.FC = () => {
 	// re-apply renderSideBySide via the options prop after the first render.
 	const diffEditorRef = React.useRef<IStandaloneDiffEditor | null>(null);
 
-	const handleDiffEditorMount = React.useCallback((editor: IStandaloneDiffEditor) => {
-		diffEditorRef.current = editor;
+		const handleDiffEditorMount = React.useCallback((editor: IStandaloneDiffEditor) => {
+			diffEditorRef.current = editor;
+			const models = editor.getModel();
+			// The installed React wrapper otherwise disposes models before their
+			// diff widget. Let the widget finish first, then release our own models.
+			editor.onDidDispose(() => {
+				if (diffEditorRef.current === editor) diffEditorRef.current = null;
+				queueMicrotask(() => {
+					for (const model of [models?.original, models?.modified]) {
+						if (model && !model.isDisposed()) model.dispose();
+					}
+				});
+			});
 		// Ensure the initial value is applied immediately
 		editor.updateOptions({ renderSideBySide: sideBySide });
 		// sideBySide intentionally omitted — we only want to sync on mount here
@@ -254,7 +266,9 @@ export const DiffViewer: React.FC = () => {
 							<DiffEditorLazy
 								original={baselineXml}
 								modified={currentXml}
-								language="xml"
+									language="xml"
+									keepCurrentOriginalModel
+									keepCurrentModifiedModel
 								theme={isDark ? "vs-dark" : "vs"}
 								height="100%"
 								onMount={handleDiffEditorMount}

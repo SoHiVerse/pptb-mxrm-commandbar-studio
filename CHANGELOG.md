@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Native exported entity schema casing (`Lead` versus logical `lead`), missing
   compiled LocLabels supplied from the original exported source, and authenticated
   CRM web-resource images rendered in the existing Fluent icon frame.
+- Native contextual SubGrid tabs, no-edit comparisons that previously reported
+  formatting/header changes, and orderly Monaco diff-model disposal on drawer close.
 
 - Correct entity child-`Name` solution XML and preservation of the original
   publisher, including its option-value prefix.

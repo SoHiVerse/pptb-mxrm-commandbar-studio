@@ -141,7 +141,13 @@ describe("preservation-aware ribbon preview", () => {
 		const input = fixture();
 		expect(() => buildRibbonPreview({ ...input, sourceSnapshot: null }, "entity")).toThrow(/source|export|unavailable/i);
 		expect(() => buildRibbonPreview({ ...input, sourceSnapshot: { ...input.sourceSnapshot, entityLogicalName: "contact" } }, "entity")).toThrow(/entity|workspace|source/i);
-		expect(() => buildRibbonPreview({ ...input, sourceSnapshot: { ...input.sourceSnapshot, applicationRibbonXml: null } }, "application")).toThrow(/application|source|unavailable/i);
+		expect(buildRibbonPreview({ ...input, sourceSnapshot: { ...input.sourceSnapshot, applicationRibbonXml: null } }, "application").originalXml).toBe('<RibbonDiffXml/>');
+	});
+
+	it("returns the unchanged raw source when the workspace has no edits", () => {
+		const result = buildRibbonPreview(fixture(), 'entity');
+		expect(result.mergedXml).toBe(result.originalXml);
+		expect(result.changed).toBe(false);
 	});
 
 	it("fails closed on malformed or conflicting original XML instead of showing a generated fragment", () => {

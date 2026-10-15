@@ -121,7 +121,9 @@ function parseTabs(doc: Document): RibbonTab[] {
 
 	// CustomAction > CommandUIDefinition can contain a second <Tab> with
 	// identical Id. Those are declarations, not additional displayed tabs.
-	doc.querySelectorAll("Tabs > Tab").forEach((tabEl) => {
+	// Subgrid tabs are rendered inside a ContextualGroup on native Dynamics;
+	// they are still the same tab/group/control model, not customization declarations.
+	doc.querySelectorAll("Tabs > Tab, ContextualTabs > ContextualGroup > Tab").forEach((tabEl) => {
 		if (tabEl.closest("CustomAction, CommandUIDefinition")) return;
 		const id = tabEl.getAttribute("Id") ?? "";
 		if (!id) return;

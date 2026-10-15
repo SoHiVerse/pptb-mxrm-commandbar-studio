@@ -40,7 +40,9 @@ export function buildRibbonPreview(input: RibbonPreviewInput, scope: RibbonPrevi
 		throw new Error("The exported ribbon source does not match the selected entity workspace.");
 	}
 
-	const originalXml = scope === "entity" ? source.entityRibbonXml : source.applicationRibbonXml;
+	// A successfully exported solution with no application layer has a known
+	// empty baseline; it is not an export failure.
+	const originalXml = scope === "entity" ? source.entityRibbonXml : source.applicationRibbonXml ?? '<RibbonDiffXml/>';
 	if (!originalXml) {
 		throw new Error(`${scope === "entity" ? "Entity" : "Application"} unmanaged ribbon source is unavailable. Export the selected solution before previewing.`);
 	}
@@ -56,7 +58,13 @@ export function buildRibbonPreview(input: RibbonPreviewInput, scope: RibbonPrevi
 		locLabels: input.current.locLabels,
 		baselineDefinitions: input.baseline,
 	}));
-	const mergedXml = mergeRibbonDiffXml(originalXml, deltas);
+	canonicalizeXml(originalXml); // reject malformed source even for an unchanged preview
+	const hasChanges = deltas.some((delta) => {
+		if (Object.entries(delta).some(([key, value]) => key !== 'xml' && Array.isArray(value) && value.length > 0)) return true;
+		const doc = new DOMParser().parseFromString(delta.xml, 'application/xml');
+		return !!doc.querySelector('CustomAction, HideCustomAction, CommandDefinition, RuleDefinitions > EnableRules > EnableRule, RuleDefinitions > DisplayRules > DisplayRule, TabDisplayRule, LocLabel, Scaling');
+	});
+	const mergedXml = hasChanges ? mergeRibbonDiffXml(originalXml, deltas) : originalXml;
 	return {
 		scope,
 		originalXml,

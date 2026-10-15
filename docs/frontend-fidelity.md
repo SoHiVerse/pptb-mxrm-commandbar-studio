@@ -43,6 +43,14 @@ Built-in `$Resources:` keys that are not supplied as localized label definitions
 still use the upstream CBS fallback in `utils/displayLabel.ts`; no guessed
 translations, fabricated icon mappings or copied replacement UI are introduced.
 
+Read-only acceptance on Lead also verified that native SubGrid tabs are children
+of `ContextualGroup`, rather than direct `Tabs` children. The data parser now
+includes both forms without treating embedded customization declarations as
+rendered tabs. An unchanged preview preserves the exact original XML and uses
+matching comparison headings, avoiding a false change count. The installed
+Monaco React wrapper's diff-model disposal order is handled without replacing
+the original editor or drawer.
+
 ## Safety boundary
 
 The frontend changes do not restore the unsafe per-location importer. Complete

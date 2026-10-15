@@ -11,6 +11,22 @@ function loadFixture(name: string): string {
 
 // ── Parsing account-full.xml ───────────────────────────────────────────────
 
+describe("native contextual ribbon tabs", () => {
+	it("loads a SubGrid tab from its server contextual group", () => {
+		const xml = '<RibbonDefinitions><RibbonDefinition><UI><Ribbon><Tabs Id="Mscrm.Tabs"/><ContextualTabs><ContextualGroup Id="Mscrm.SubGrid.lead.ContextualTabs"><Tab Id="Mscrm.SubGrid.lead.MainTab" Title="Leads"><Groups><Group Id="lead.Management" Title="Manage"><Controls><Button Id="test.Reminder" Command="test.ReminderCommand" LabelText="Reminder"/></Controls></Group></Groups></Tab></ContextualGroup></ContextualTabs></Ribbon></UI></RibbonDefinition></RibbonDefinitions>';
+		const { ribbon } = parseRibbonXml(xml, 'SubGrid', 'lead');
+		expect(ribbon.tabs).toHaveLength(1);
+		expect(ribbon.tabs[0].id).toBe('Mscrm.SubGrid.lead.MainTab');
+		expect(ribbon.tabs[0].groups[0].buttons[0].label).toBe('Reminder');
+	});
+
+	it("does not treat an embedded contextual override declaration as another rendered tab", () => {
+		const tab = '<ContextualTabs><ContextualGroup Id="group"><Tab Id="tab" Title="Tab"><Groups/></Tab></ContextualGroup></ContextualTabs>';
+		const { ribbon } = parseRibbonXml(`<Ribbon>${tab}<CustomActions><CustomAction Id="override"><CommandUIDefinition>${tab}</CommandUIDefinition></CustomAction></CustomActions></Ribbon>`, 'SubGrid', 'lead');
+		expect(ribbon.tabs).toHaveLength(1);
+	});
+});
+
 describe("parseRibbonXml — account entity", () => {
 	const xml = loadFixture("account-full.xml");
 

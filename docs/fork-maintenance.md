@@ -7,33 +7,34 @@ not `main`. This fork-only branch contains the sync workflow, read-only review
 CI, and a dependency lockfile. None of those files should appear in the
 upstream-targeted feature branch's diff or commits.
 
-The contribution branch is `feat/onpremises-v91-native`. A draft PR in the
-personal fork proposes this branch into the fork's `dev`. Only after review
-should a separate PR be submitted to the upstream repository's `dev`.
+**PR #1 was merged into fork `dev` on 2026-10-15**. The fork's default
+`dev` branch now contains BOTH the native Dynamics implementation and
+fork-only maintenance. This is the branch users should update and build.
+The older `feat/onpremises-v91-native` branch is optional historical
+contribution history for a possible separate PR to the original author.
+The scheduled workflow no longer depends on it or updates it.
 
 ## Automatic updates
 
 `.github/workflows/fork-upstream-sync.yml` runs daily at **04:37 UTC** and
 supports manual **Actions → Fork-only upstream synchronization → Run workflow**.
-It fetches upstream `dev` and prepares two different non-destructive merges:
+It performs one normal merge: **original `upstream/dev` into fork `dev`**.
+This retains the already merged native support and fork-only maintenance
+history. It does not rebase, reset, force-push, or change the old feature branch.
 
-1. `upstream/dev` into fork `dev` (retains fork-only maintenance files).
-2. `upstream/dev` **directly** into `feat/onpremises-v91-native`, rather than
-   pulling the fork's maintenance-only history into an upstream PR.
-
-Before pushing an updated feature, the workflow checks the merge for conflicts
-and runs TypeScript, ESLint, Vitest, package tests and both production builds.
-It tests with this fork's pinned `package-lock.json` **without committing it
-to the upstream-targeted feature branch**. An upstream dependency-manifest
-change that disagrees with the fork's lockfile intentionally stops the update
-until the lockfile is reviewed. The final push is atomic (both refs or neither),
-non-force, and first checks that neither branch changed during verification.
+If upstream is already included, there is nothing to change. Otherwise the
+workflow first checks the merge for conflicts and runs TypeScript, ESLint,
+Vitest, package tests and BOTH production builds on the combined fork dev.
+An upstream dependency-manifest change incompatible with the fork's pinned
+`package-lock.json` intentionally stops the update until that lockfile is
+reviewed. Once checks pass, a second upstream/fork fetch detects races,
+then a normal, non-force fast-forward push advances fork `dev` only.
 
 The fork's `GITHUB_TOKEN` is supplied to the final push only; no personal access
 token, cloud credentials or workflow secrets are needed. Failures stop with no
 force/reset/automatic conflict resolution. A conflict, GitHub workflow change,
-dependency mismatch, failed test, missing permission, changed remote tip or
-unsupported atomic push requires human review in the failed Actions run.
+dependency mismatch, failed test, missing permission or changed remote tip
+requires human review in the failed Actions run.
 
 GitHub does **not** trigger ordinary push-driven workflows for commits created
 by its `GITHUB_TOKEN`. That is why this sync workflow performs checks **before**
@@ -48,9 +49,9 @@ branch with an empty commit or bringing fork-maintenance history into it.
 On a newly created fork, enable GitHub Actions and explicitly enable the
 scheduled workflow in the fork's **Actions** tab. After enabling, run it
 manually once and confirm a green result. When upstream has not changed, a
-manual run also performs a **dry-run atomic push** with the scoped Actions token
-to verify that future automatic pushes will be authorized, without changing
-either branch. You can also use the `Fork review
+manual run performs a **dry-run fast-forward push** with the scoped Actions
+token, verifying permissions without changing `dev`.
+You can also use the `Fork review
 checks` workflow to test a pull request. Leave the repository's default
 `GITHUB_TOKEN` read-only; each job specifies the narrow permissions it needs.
 
@@ -64,20 +65,26 @@ Monitor failed Actions notifications. Schedule execution may be delayed.
 ## Manual recovery / later upstream submission
 
 In the local Git checkout, `upstream` points to Mohsin's repository and
-`origin` to your fork. Never force-push this contribution branch as part of
-automated synchronization.
+`origin` to your fork. To inspect a future upstream update manually before
+updating the fork, use a temporary **integration branch from the fork dev**:
 
 ```sh
 git fetch upstream dev
-git fetch origin dev feat/onpremises-v91-native
-git switch feat/onpremises-v91-native
+git fetch origin dev
+git switch -c review-upstream-sync origin/dev
 git merge upstream/dev
-npm ci                 # only if a matching local lockfile is available
+npm ci
 npm run typecheck && npm run lint && npm test -- --maxWorkers=2
-git push origin feat/onpremises-v91-native
+# Only after reviewing and verifying this integration:
+git push origin HEAD:refs/heads/dev
 ```
 
 On a merge conflict, resolve and verify deliberately before pushing; do not
-silently select either side. To contribute upstream later, use the clean
-`feat/onpremises-v91-native` head as the source and **target upstream `dev`**.
-Keep the fork-only automation and lockfile out of that upstream PR.
+silently select either side. If the local checkout has an old untracked
+`package-lock.json`, back it up before switching into fork `dev`; this
+file is TRACKED on the fork dev and must not be overwritten accidentally.
+
+To contribute the on-prem feature to the upstream author later, start from
+the separate clean `feat/onpremises-v91-native` branch and merge the latest
+`upstream/dev` into it manually with tests. Do **not** use the fork dev branch
+as the upstream PR source: it contains fork-specific workflows and lockfile.

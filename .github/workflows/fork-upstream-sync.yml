@@ -1,0 +1,130 @@
+name: Fork-only upstream synchronization
+
+# This workflow intentionally exists ONLY on SoHiVerse's default dev branch.
+# Never merge the fork's dev branch into the upstream-targeted feature branch:
+# the feature branch must inherit changes from mohsinonxrm/dev directly.
+on:
+  schedule:
+    - cron: '37 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-only-upstream-dev-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'SoHiVerse/pptb-mxrm-commandbar-studio' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout fork without persisting a write credential
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare conflict-safe candidate merges
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/mohsinonxrm/pptb-mxrm-commandbar-studio.git
+          git fetch --no-tags upstream +refs/heads/dev:refs/remotes/upstream/dev
+          git fetch --no-tags origin +refs/heads/dev:refs/remotes/origin/dev +refs/heads/feat/onpremises-v91-native:refs/remotes/origin/feat/onpremises-v91-native
+
+          upstream_sha="$(git rev-parse refs/remotes/upstream/dev)"
+          fork_sha="$(git rev-parse refs/remotes/origin/dev)"
+          feature_sha="$(git rev-parse refs/remotes/origin/feat/onpremises-v91-native)"
+          printf 'upstream_sha=%s\nfork_sha=%s\nfeature_sha=%s\n' "$upstream_sha" "$fork_sha" "$feature_sha" >> "$GITHUB_OUTPUT"
+
+          fork_changed=false
+          git checkout -B sync-fork-dev "$fork_sha"
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            git merge --no-edit "$upstream_sha"
+            fork_changed=true
+          fi
+          # A bot token may not update GitHub workflow files; it should not try.
+          if [[ -n "$(git diff --name-only "$fork_sha" HEAD -- .github/workflows)" ]]; then
+            echo 'Upstream changed GitHub workflows. Manual review required; no refs pushed.' >&2
+            exit 1
+          fi
+
+          feature_changed=false
+          git checkout -B sync-feature "$feature_sha"
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            # Deliberately merge ORIGINAL upstream, not fork dev, keeping
+            # fork-only workflow/lockfile commits out of the upstream PR.
+            git merge --no-edit "$upstream_sha"
+            feature_changed=true
+          fi
+          if [[ -n "$(git diff --name-only "$feature_sha" HEAD -- .github/workflows)" ]] ||
+             git cat-file -e HEAD:.github/workflows/fork-upstream-sync.yml 2>/dev/null; then
+            echo 'Upstream-targeted feature must not import fork-only workflows; no refs pushed.' >&2
+            exit 1
+          fi
+          printf 'fork_changed=%s\nfeature_changed=%s\n' "$fork_changed" "$feature_changed" >> "$GITHUB_OUTPUT"
+          echo "Upstream: $upstream_sha; fork update: $fork_changed; feature update: $feature_changed"
+
+      - name: Set up Node for the candidate's read-only checks
+        if: steps.merge.outputs.feature_changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify proposed feature merge before either branch is pushed
+        if: steps.merge.outputs.feature_changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout sync-feature
+          # The fork-only default branch pins dependencies for CI; the clean
+          # contribution branch itself intentionally does not track a lockfile.
+          git show refs/remotes/origin/dev:package-lock.json > package-lock.json
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run lint
+          npm test -- --maxWorkers=2
+          npm run test:package:onprem
+          npm run build
+          npm run build:onprem
+          rm package-lock.json
+          if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+            echo 'Candidate checks changed tracked/untracked source; refusing to push.' >&2
+            git status --short
+            exit 1
+          fi
+
+      - name: Recheck remote tips and push both safe updates atomically
+        if: steps.merge.outputs.fork_changed == 'true' || steps.merge.outputs.feature_changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_FORK: ${{ steps.merge.outputs.fork_sha }}
+          EXPECTED_FEATURE: ${{ steps.merge.outputs.feature_sha }}
+          EXPECTED_UPSTREAM: ${{ steps.merge.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/dev:refs/remotes/origin/dev +refs/heads/feat/onpremises-v91-native:refs/remotes/origin/feat/onpremises-v91-native
+          [[ "$(git rev-parse refs/remotes/origin/dev)" == "$EXPECTED_FORK" ]] || { echo 'Fork dev changed during checks; retry later.' >&2; exit 1; }
+          [[ "$(git rev-parse refs/remotes/origin/feat/onpremises-v91-native)" == "$EXPECTED_FEATURE" ]] || { echo 'Feature changed during checks; retry later.' >&2; exit 1; }
+          [[ "$(git rev-parse refs/remotes/upstream/dev)" == "$EXPECTED_UPSTREAM" ]] || { echo 'Unexpected upstream candidate; retry later.' >&2; exit 1; }
+          # Expose the short-lived fork token only to the final git push.
+          cat > "$RUNNER_TEMP/fork-askpass" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$GH_TOKEN" ;;
+          esac
+          ASKPASS
+          chmod 700 "$RUNNER_TEMP/fork-askpass"
+          GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$RUNNER_TEMP/fork-askpass" \
+            git push --atomic origin \
+              sync-fork-dev:refs/heads/dev \
+              sync-feature:refs/heads/feat/onpremises-v91-native
+          rm -f "$RUNNER_TEMP/fork-askpass"

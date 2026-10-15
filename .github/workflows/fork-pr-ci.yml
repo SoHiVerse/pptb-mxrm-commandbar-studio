@@ -1,0 +1,41 @@
+name: Fork review checks
+
+on:
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    if: github.repository == 'SoHiVerse/pptb-mxrm-commandbar-studio'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Reproducible fork-only dependency installation
+        run: npm ci --no-audit --no-fund
+      - name: Type-check
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Unit and UI tests
+        run: npm test -- --maxWorkers=2
+      - name: Native package tests
+        run: npm run test:package:onprem
+      - name: Original PPTB production build
+        run: npm run build
+      - name: Native Dynamics production build
+        run: npm run build:onprem

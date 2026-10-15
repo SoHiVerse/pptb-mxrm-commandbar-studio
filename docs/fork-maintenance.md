@@ -39,6 +39,10 @@ GitHub does **not** trigger ordinary push-driven workflows for commits created
 by its `GITHUB_TOKEN`. That is why this sync workflow performs checks **before**
 its push; the separate fork PR workflow checks human-submitted changes.
 
+The fork's PR checks also rerun on a PR metadata edit. This permits a fresh
+check after a fork-only lockfile repair without polluting the upstream feature
+branch with an empty commit or bringing fork-maintenance history into it.
+
 ## One-time Actions activation and inactivity caveat
 
 On a newly created fork, enable GitHub Actions and explicitly enable the

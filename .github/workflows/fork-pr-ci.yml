@@ -3,6 +3,9 @@ name: Fork review checks
 on:
   pull_request:
     branches: [dev]
+    # Allow a fresh PR check after changing only the fork's lockfile,
+    # without unnecessary empty commits on the upstream contribution branch.
+    types: [opened, reopened, synchronize, edited]
   workflow_dispatch:
 
 permissions:

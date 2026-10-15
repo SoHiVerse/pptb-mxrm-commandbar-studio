@@ -1,5 +1,8 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
+import { draftPublisherIdentity } from "@/utils/draftSource";
+import { rebasePendingWorkspace } from "@/services/ribbonSourceRebase";
+import type { RibbonDefinitions, RibbonDraft, RibbonSourceSnapshot, RibbonWorkspace } from "@/types/workspace";
 import type {
 	RibbonLocation,
 	RibbonDefinition,
@@ -31,6 +34,10 @@ export interface HistoryEntry {
 export type RibbonStoreState = {
 	ribbons: Record<RibbonLocation, RibbonDefinition>;
 	baseline: Record<RibbonLocation, RibbonDefinition>;
+	baselineDefinitions: RibbonDefinitions;
+	sourceSnapshot: RibbonSourceSnapshot | null;
+	workspaceGeneration: number;
+	workspaceReadOnly: boolean;
 	commands: CommandDefinition[];
 	displayRules: DisplayRule[];
 	enableRules: EnableRule[];
@@ -50,6 +57,7 @@ export interface RibbonWorkspaceSeed {
 	locLabels: LocLabel[];
 	templates?: GroupTemplate[];
 	conflicts?: ConflictEntry[];
+	sourceSnapshot?: RibbonSourceSnapshot | null;
 }
 
 type DragSource = { groupId: string; buttonId: string; tabId: string; location: RibbonLocation };
@@ -121,15 +129,74 @@ export interface RibbonStore extends RibbonStoreState {
 	upsertEnableRule(rule: EnableRule): void;
 	renameEnableRuleId(oldId: string, newId: string): boolean;
 	upsertLocLabel(label: LocLabel): void;
-	markPublished(): void;
+	markPublished(published?: RibbonWorkspace, sourceSnapshot?: RibbonSourceSnapshot, expectedGeneration?: number, submittedWorkspace?: RibbonWorkspace): void;
+	restoreDraft(draft: RibbonDraft): void;
+	applyWorkspaceEdit(workspace: RibbonWorkspace, description: string): void;
 	setConflicts(entries: ConflictEntry[]): void;
 
 	// Load initial data
 	loadRibbons(ribbons: Record<RibbonLocation, RibbonDefinition>): void;
 	loadWorkspace(seed: RibbonWorkspaceSeed): void;
+	clearWorkspace(): void;
 }
 
 const MAX_HISTORY = 80;
+
+function clone<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value)) as T;
+}
+
+export function getEditableWorkspace(state: RibbonStoreState): RibbonWorkspace {
+	return {
+		ribbons: state.ribbons,
+		commands: state.commands,
+		displayRules: state.displayRules,
+		enableRules: state.enableRules,
+		locLabels: state.locLabels,
+	};
+}
+
+export function getBaselineWorkspace(state: RibbonStoreState): RibbonWorkspace {
+	return { ribbons: state.baseline, ...state.baselineDefinitions };
+}
+
+function getDefinitions(seed: RibbonDefinitions): RibbonDefinitions {
+	return clone({ commands: seed.commands, displayRules: seed.displayRules, enableRules: seed.enableRules, locLabels: seed.locLabels });
+}
+
+function sameWorkspace(left: RibbonWorkspace, right: RibbonWorkspace): boolean {
+	// Callers may construct the top-level object in a different property order.
+	const values = (value: RibbonWorkspace) => [value.ribbons, value.commands, value.displayRules, value.enableRules, value.locLabels];
+	return JSON.stringify(values(left)) === JSON.stringify(values(right));
+}
+
+function dirtyCount(state: RibbonStoreState, workspace: RibbonWorkspace, proposed: number): number {
+	return sameWorkspace(workspace, getBaselineWorkspace(state)) ? 0 : Math.max(1, proposed);
+}
+
+function sameSourceIdentity(left: RibbonSourceSnapshot, right: RibbonSourceSnapshot): boolean {
+	return left.solutionUniqueName === right.solutionUniqueName &&
+		left.entityLogicalName === right.entityLogicalName &&
+		left.organizationUrl === right.organizationUrl && left.userId === right.userId;
+}
+
+function commitDefinitions(
+	state: RibbonStoreState,
+	patch: Partial<RibbonDefinitions>,
+	target: string,
+): Partial<RibbonStoreState> {
+	assertWorkspaceEditable(state);
+	const next = { ...getEditableWorkspace(state), ...clone(patch) };
+	if (sameWorkspace(next, getEditableWorkspace(state))) return {};
+	const entry: HistoryEntry = {
+		ts: new Date().toISOString(), userId: "", userName: "You", op: "edited", target,
+		detail: Object.keys(patch).join(", "), icon: "edit", color: "info", snapshot: { ...state },
+	};
+	return {
+		...clone(patch), past: [...state.past, entry].slice(-MAX_HISTORY), future: [],
+		mutationsSincePublish: dirtyCount(state, next, state.mutationsSincePublish + 1)
+	};
+}
 
 function cloneRibbons(
 	ribbons: Record<RibbonLocation, RibbonDefinition>,
@@ -142,16 +209,22 @@ function commitMutation(
 	mutator: (ribbons: Record<RibbonLocation, RibbonDefinition>) => void,
 	meta: Omit<HistoryEntry, "snapshot">,
 ): Partial<RibbonStoreState> {
+	assertWorkspaceEditable(state);
 	const next = cloneRibbons(state.ribbons);
 	mutator(next);
+	if (JSON.stringify(next) === JSON.stringify(state.ribbons)) return {};
 	const entry: HistoryEntry = { ...meta, snapshot: { ...state } };
 	const past = [...state.past, entry].slice(-MAX_HISTORY);
 	return {
 		ribbons: next,
 		past,
 		future: [],
-		mutationsSincePublish: state.mutationsSincePublish + 1,
+		mutationsSincePublish: dirtyCount(state, { ...getEditableWorkspace(state), ribbons: next }, state.mutationsSincePublish + 1),
 	};
+}
+
+function assertWorkspaceEditable(state: RibbonStoreState): void {
+	if (state.workspaceReadOnly) throw new Error("This workspace is read-only until its unmanaged source can be loaded. Retry the source export before editing.");
 }
 
 const EMPTY_RIBBONS: Record<RibbonLocation, RibbonDefinition> = {
@@ -178,6 +251,10 @@ export const useRibbonStore = create<RibbonStore>()(
 	subscribeWithSelector((set, get) => ({
 		ribbons: cloneRibbons(EMPTY_RIBBONS),
 		baseline: cloneRibbons(EMPTY_RIBBONS),
+		baselineDefinitions: { commands: [], displayRules: [], enableRules: [], locLabels: [] },
+		sourceSnapshot: null,
+		workspaceGeneration: 0,
+		workspaceReadOnly: true,
 		commands: [],
 		displayRules: [],
 		enableRules: [],
@@ -190,8 +267,12 @@ export const useRibbonStore = create<RibbonStore>()(
 
 		loadRibbons(ribbons) {
 			set({
+				workspaceGeneration: get().workspaceGeneration + 1,
+				workspaceReadOnly: false,
 				ribbons: cloneRibbons(ribbons),
 				baseline: cloneRibbons(ribbons),
+				baselineDefinitions: getDefinitions(get()),
+				sourceSnapshot: null,
 				mutationsSincePublish: 0,
 				past: [],
 				future: [],
@@ -205,12 +286,15 @@ export const useRibbonStore = create<RibbonStore>()(
 		loadWorkspace(seed) {
 			const ribbons = cloneRibbons(seed.ribbons);
 			set({
+				workspaceGeneration: get().workspaceGeneration + 1,
+					// Source availability governs server publication, not the original
+					// client-side editor. An empty/unselected workspace remains guarded.
+					workspaceReadOnly: !ribbons.Form.entityLogicalName,
 				ribbons,
 				baseline: cloneRibbons(ribbons),
-				commands: [...seed.commands],
-				displayRules: [...seed.displayRules],
-				enableRules: [...seed.enableRules],
-				locLabels: [...seed.locLabels],
+				...getDefinitions(seed),
+				baselineDefinitions: getDefinitions(seed),
+				sourceSnapshot: seed.sourceSnapshot ? clone(seed.sourceSnapshot) : null,
 				templates: [...(seed.templates ?? [])],
 				conflicts: [...(seed.conflicts ?? [])],
 				mutationsSincePublish: 0,
@@ -220,36 +304,47 @@ export const useRibbonStore = create<RibbonStore>()(
 		},
 
 		undo() {
-			const { past, future, ribbons } = get();
+			const state = get();
+			assertWorkspaceEditable(state);
+			const { past, future } = state;
 			if (past.length === 0) return;
 			const entry = past[past.length - 1];
+			const editable = clone(getEditableWorkspace(entry.snapshot));
 			set({
-				ribbons: entry.snapshot.ribbons,
+				...editable,
 				past: past.slice(0, -1),
-				future: [{ ...entry, snapshot: { ...get(), ribbons } }, ...future],
-				mutationsSincePublish: Math.max(0, get().mutationsSincePublish - 1),
+				future: [{ ...entry, snapshot: { ...state } }, ...future],
+				mutationsSincePublish: dirtyCount(state, editable, state.mutationsSincePublish - 1),
 			});
 		},
 
 		redo() {
-			const { future, ribbons } = get();
+			const state = get();
+			assertWorkspaceEditable(state);
+			const { future } = state;
 			if (future.length === 0) return;
 			const [entry, ...rest] = future;
+			const editable = clone(getEditableWorkspace(entry.snapshot));
 			set({
-				ribbons: entry.snapshot.ribbons,
-				past: [...get().past, { ...entry, snapshot: { ...get(), ribbons } }],
+				...editable,
+				past: [...state.past, { ...entry, snapshot: { ...state } }].slice(-MAX_HISTORY),
 				future: rest,
-				mutationsSincePublish: get().mutationsSincePublish + 1,
+				mutationsSincePublish: dirtyCount(state, editable, state.mutationsSincePublish + 1),
 			});
 		},
 
 		restore(index) {
+			assertWorkspaceEditable(get());
 			const { past } = get();
 			if (index < 0 || index >= past.length) return;
 			const target = past[index];
 			const currentSnapshot: RibbonStoreState = {
 				ribbons: cloneRibbons(get().ribbons),
 				baseline: cloneRibbons(get().baseline),
+				baselineDefinitions: getDefinitions(get().baselineDefinitions),
+				sourceSnapshot: get().sourceSnapshot,
+				workspaceGeneration: get().workspaceGeneration,
+				workspaceReadOnly: get().workspaceReadOnly,
 				commands: [...get().commands],
 				displayRules: [...get().displayRules],
 				enableRules: [...get().enableRules],
@@ -263,14 +358,13 @@ export const useRibbonStore = create<RibbonStore>()(
 
 			set({
 				ribbons: cloneRibbons(target.snapshot.ribbons),
-				baseline: cloneRibbons(target.snapshot.baseline),
 				commands: [...target.snapshot.commands],
 				displayRules: [...target.snapshot.displayRules],
 				enableRules: [...target.snapshot.enableRules],
 				locLabels: [...target.snapshot.locLabels],
 				templates: [...target.snapshot.templates],
 				conflicts: [...target.snapshot.conflicts],
-				mutationsSincePublish: target.snapshot.mutationsSincePublish,
+				mutationsSincePublish: dirtyCount(get(), getEditableWorkspace(target.snapshot), get().mutationsSincePublish + 1),
 				past: past.slice(0, index + 1),
 				future: [
 					{
@@ -302,7 +396,6 @@ export const useRibbonStore = create<RibbonStore>()(
 						if (btnIdx === -1) return;
 						if (isReadOnlyGlobalOobButton(src.location, src.tabId, srcGroup.buttons[btnIdx]))
 							return;
-						const [button] = srcGroup.buttons.splice(btnIdx, 1);
 						const dstTab =
 							src.tabId === dst.tabId && src.location === dst.location
 								? tab
@@ -310,10 +403,14 @@ export const useRibbonStore = create<RibbonStore>()(
 						if (!dstTab) return;
 						const dstGroup = dstTab.groups.find((g) => g.id === dst.groupId);
 						if (!dstGroup) return;
+						if (src.location === dst.location && src.groupId === dst.groupId && dst.beforeButtonId === src.buttonId) return;
+						const [button] = srcGroup.buttons.splice(btnIdx, 1);
 						const insertIdx = dst.beforeButtonId
 							? dstGroup.buttons.findIndex((b) => b.id === dst.beforeButtonId)
 							: dstGroup.buttons.length;
 						dstGroup.buttons.splice(insertIdx < 0 ? dstGroup.buttons.length : insertIdx, 0, button);
+						// Sequence is part of the persisted ribbon, unlike the UI array order.
+						dstGroup.buttons.forEach((item, index) => { item.sequence = (index + 1) * 10; });
 					},
 					{
 						ts: new Date().toISOString(),
@@ -809,11 +906,12 @@ export const useRibbonStore = create<RibbonStore>()(
 					existing >= 0
 						? state.commands.map((c, i) => (i === existing ? cmd : c))
 						: [...state.commands, cmd];
-				return { commands, mutationsSincePublish: state.mutationsSincePublish + 1 };
+				return commitDefinitions(state, { commands }, cmd.id);
 			});
 		},
 
 		renameCommandId(oldId, newId) {
+			assertWorkspaceEditable(get());
 			const state = get();
 			if (!oldId || !newId || oldId === newId) return true;
 			if (state.commands.some((c) => c.id === newId)) return false;
@@ -835,9 +933,9 @@ export const useRibbonStore = create<RibbonStore>()(
 				const commands = current.commands.map((c) =>
 					c.id === oldId
 						? {
-								...c,
-								id: newId,
-							}
+							...c,
+							id: newId,
+						}
 						: c,
 				);
 
@@ -872,11 +970,12 @@ export const useRibbonStore = create<RibbonStore>()(
 					existing >= 0
 						? state.displayRules.map((r, i) => (i === existing ? rule : r))
 						: [...state.displayRules, rule];
-				return { displayRules, mutationsSincePublish: state.mutationsSincePublish + 1 };
+				return commitDefinitions(state, { displayRules }, rule.id);
 			});
 		},
 
 		renameDisplayRuleId(oldId, newId) {
+			assertWorkspaceEditable(get());
 			const state = get();
 			if (!oldId || !newId || oldId === newId) return true;
 			if (state.displayRules.some((r) => r.id === newId)) return false;
@@ -885,9 +984,9 @@ export const useRibbonStore = create<RibbonStore>()(
 				const displayRules = current.displayRules.map((r) =>
 					r.id === oldId
 						? {
-								...r,
-								id: newId,
-							}
+							...r,
+							id: newId,
+						}
 						: r,
 				);
 				const commands = current.commands.map((c) => ({
@@ -926,11 +1025,12 @@ export const useRibbonStore = create<RibbonStore>()(
 					existing >= 0
 						? state.enableRules.map((r, i) => (i === existing ? rule : r))
 						: [...state.enableRules, rule];
-				return { enableRules, mutationsSincePublish: state.mutationsSincePublish + 1 };
+				return commitDefinitions(state, { enableRules }, rule.id);
 			});
 		},
 
 		renameEnableRuleId(oldId, newId) {
+			assertWorkspaceEditable(get());
 			const state = get();
 			if (!oldId || !newId || oldId === newId) return true;
 			if (state.enableRules.some((r) => r.id === newId)) return false;
@@ -939,9 +1039,9 @@ export const useRibbonStore = create<RibbonStore>()(
 				const enableRules = current.enableRules.map((r) =>
 					r.id === oldId
 						? {
-								...r,
-								id: newId,
-							}
+							...r,
+							id: newId,
+						}
 						: r,
 				);
 				const commands = current.commands.map((c) => ({
@@ -980,15 +1080,70 @@ export const useRibbonStore = create<RibbonStore>()(
 					existing >= 0
 						? state.locLabels.map((l, i) => (i === existing ? label : l))
 						: [...state.locLabels, label];
-				return { locLabels };
+				return commitDefinitions(state, { locLabels }, label.id);
 			});
 		},
 
-		markPublished() {
-			set((state) => ({
-				baseline: cloneRibbons(state.ribbons),
-				mutationsSincePublish: 0,
-			}));
+		markPublished(published, sourceSnapshot, expectedGeneration, submittedWorkspace) {
+			const state = get();
+			if (expectedGeneration !== undefined && state.workspaceGeneration !== expectedGeneration) {
+				throw new Error("The workspace was reloaded while publication was running. Its new baseline was not changed.");
+			}
+			if (sourceSnapshot && (!state.sourceSnapshot || !sameSourceIdentity(sourceSnapshot, state.sourceSnapshot))) {
+				throw new Error("The workspace changed while publication was running. Reload its verified result separately.");
+			}
+			const completed = clone(published ?? getEditableWorkspace(state));
+			if (completed.ribbons.Form.entityLogicalName !== state.ribbons.Form.entityLogicalName) {
+				throw new Error("The selected entity changed while publication was running.");
+			}
+			const current = submittedWorkspace ? rebasePendingWorkspace(getEditableWorkspace(state), submittedWorkspace, completed) : getEditableWorkspace(state);
+			set({
+				...current,
+				baseline: cloneRibbons(completed.ribbons),
+				baselineDefinitions: getDefinitions(completed),
+				sourceSnapshot: sourceSnapshot ? clone(sourceSnapshot) : state.sourceSnapshot,
+				mutationsSincePublish: sameWorkspace(current, completed) ? 0 : Math.max(1, state.mutationsSincePublish),
+			});
+		},
+
+		clearWorkspace() {
+			get().loadWorkspace({ ribbons: cloneRibbons(EMPTY_RIBBONS), commands: [], displayRules: [], enableRules: [], locLabels: [], sourceSnapshot: null });
+		},
+
+		restoreDraft(draft) {
+			const state = get();
+			assertWorkspaceEditable(state);
+			if (draft.version !== 2 || !state.sourceSnapshot || !sameSourceIdentity(draft.sourceSnapshot, state.sourceSnapshot)) {
+				throw new Error("The draft does not match this organization, solution and entity workspace.");
+			}
+			if (draft.sourceSnapshot.solutionVersion !== state.sourceSnapshot.solutionVersion ||
+				draftPublisherIdentity(draft.sourceSnapshot.solutionXml) !== draftPublisherIdentity(state.sourceSnapshot.solutionXml)) {
+				throw new Error("The solution version or publisher changed since this draft was saved. Reload and reconcile the draft before publishing.");
+			}
+			// A conservative comparison: differing server XML requires reconciliation, not blind restoration.
+			const compact = (xml: string | null) => xml?.replace(/>\s+</g, "><").trim() ?? null;
+			if (compact(draft.sourceSnapshot.entityRibbonXml) !== compact(state.sourceSnapshot.entityRibbonXml) ||
+				compact(draft.sourceSnapshot.applicationRibbonXml) !== compact(state.sourceSnapshot.applicationRibbonXml) ||
+				!sameWorkspace(draft.baseline, getBaselineWorkspace(state))) {
+				throw new Error("The server ribbon baseline changed since this draft was saved. Export the draft and reconcile the conflict before publishing.");
+			}
+			const editable = clone(draft.current);
+			if (editable.ribbons.Form.entityLogicalName !== state.ribbons.Form.entityLogicalName) {
+				throw new Error("The draft entity does not match the loaded workspace.");
+			}
+			set({ ...editable, past: [], future: [], mutationsSincePublish: dirtyCount(state, editable, 1) });
+		},
+
+		applyWorkspaceEdit(workspace, description) {
+			const state = get();
+			assertWorkspaceEditable(state);
+			for (const location of ["HomepageGrid", "SubGrid", "Form", "Application"] as const) {
+				if (workspace.ribbons[location].entityLogicalName !== state.ribbons[location].entityLogicalName) throw new Error("Imported XML does not match the loaded entity workspace.");
+			}
+			const next = clone(workspace);
+			if (sameWorkspace(next, getEditableWorkspace(state))) return;
+			const entry: HistoryEntry = { ts: new Date().toISOString(), userId: "", userName: "You", op: "imported", target: "workspace", detail: description, icon: "edit", color: "info", snapshot: { ...state } };
+			set({ ...next, past: [...state.past, entry].slice(-MAX_HISTORY), future: [], mutationsSincePublish: dirtyCount(state, next, state.mutationsSincePublish + 1) });
 		},
 	})),
 );

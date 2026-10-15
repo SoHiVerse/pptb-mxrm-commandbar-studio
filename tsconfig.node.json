@@ -1,6 +1,8 @@
 {
   "compilerOptions": {
     "composite": true,
+	"outDir": "./node_modules/.cache/cbs-config",
+	"tsBuildInfoFile": "./node_modules/.cache/cbs-config/tsconfig.node.tsbuildinfo",
     "target": "ES2022",
     "lib": ["ES2022", "DOM"],
     "module": "ESNext",
@@ -13,5 +15,5 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["vite.config.ts", "vitest.config.ts", "commitlint.config.ts"]
+  "include": ["vite.config.ts", "vite.onprem.config.ts", "vitest.config.ts", "commitlint.config.ts"]
 }

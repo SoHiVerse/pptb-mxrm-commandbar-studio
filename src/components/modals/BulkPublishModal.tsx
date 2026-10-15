@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React from "react";
 import {
 	Badge,
 	Button,
@@ -22,16 +22,7 @@ import {
 	makeStyles,
 	tokens,
 } from "@fluentui/react-components";
-import { useUIStore } from "@/store/uiStore";
-import { useRibbonStore } from "@/store/ribbonStore";
-import { useSessionStore } from "@/store/sessionStore";
-import { useRuntimeLogStore } from "@/store/runtimeLogStore";
-import {
-	publishAllAsync,
-	publishRibbon,
-	publishUsingPublishXml,
-} from "@/services/dataverse/publishService";
-import { summarizeRibbonDiff } from "@/services/xmlGenerator";
+import { useRibbonPublishController } from "@/hooks/useRibbonPublishController";
 
 const useStyles = makeStyles({
 	content: {
@@ -61,240 +52,22 @@ const useStyles = makeStyles({
 	},
 });
 
-type PublishStatus = "pending" | "publishing" | "success" | "error";
-
 export const BulkPublishModal: React.FC = () => {
 	const styles = useStyles();
-	const bulkPublishOpen = useUIStore((s) => s.bulkPublishOpen);
-	const closeBulkPublish = useUIStore((s) => s.closeBulkPublish);
-	const openXmlDrawer = useUIStore((s) => s.openXmlDrawer);
-	const ribbons = useRibbonStore((s) => s.ribbons);
-	const baseline = useRibbonStore((s) => s.baseline);
-	const commands = useRibbonStore((s) => s.commands);
-	const displayRules = useRibbonStore((s) => s.displayRules);
-	const enableRules = useRibbonStore((s) => s.enableRules);
-	const locLabels = useRibbonStore((s) => s.locLabels);
-	const markPublished = useRibbonStore((s) => s.markPublished);
-	const mutationsSincePublish = useRibbonStore((s) => s.mutationsSincePublish);
-	const activeSolution = useSessionStore((s) => s.activeSolution);
-	const activeEntity = useSessionStore((s) => s.activeEntity);
-	const entities = useSessionStore((s) => s.entities);
-	const publisherPrefix = useSessionStore((s) => s.publisherPrefix);
-	const solutionRibbonComponentIds = useSessionStore(
-		(s) => s.solutionRibbonComponentIds,
-	);
-
-	// Application-ribbon publish is only meaningful when the user's solution
-	// has the application ribbon registered as a component (componenttype=50).
-	// Without that, Dataverse rejects the import with 0x8004803a regardless
-	// of how the customizations.xml is constructed.
-	const solutionSupportsAppRibbon =
-		Array.isArray(solutionRibbonComponentIds) && solutionRibbonComponentIds.length > 0;
-
-	const [selectedEntities, setSelectedEntities] = useState<string[]>(
-		activeEntity ? [activeEntity.logicalName] : [],
-	);
-	// Default to OFF — opt-in. Was previously ON, which caused empty-diff
-	// imports for every publish even when the user never touched the
-	// application ribbon. Auto-off also avoids the 0x8004803a footgun when
-	// the user's solution doesn't include Application Ribbons.
-	const [includeApplicationRibbon, setIncludeApplicationRibbon] = useState(false);
-	const [publishing, setPublishing] = useState(false);
-	const [statusMap, setStatusMap] = useState<Record<string, PublishStatus>>({});
-	const [done, setDone] = useState(false);
-	const [incrementSolutionVersion, setIncrementSolutionVersion] = useState(false);
-	const [publishDependencies, setPublishDependencies] = useState(true);
-	const [publishStrategy, setPublishStrategy] = useState<"targeted" | "allAsync">("targeted");
-	const [progressMessage, setProgressMessage] = useState("");
-	const [publishComment, setPublishComment] = useState("");
-	const [solutionVersion, setSolutionVersion] = useState(activeSolution?.version ?? "1.0.0.0");
-	const [errorMessages, setErrorMessages] = useState<{ scope: string; message: string }[]>([]);
-
-	const nextVersion = React.useMemo(() => {
-		const base = solutionVersion || activeSolution?.version || "1.0.0.0";
-		const parts = base.split(".").map((n) => Number.parseInt(n, 10) || 0);
-		while (parts.length < 4) parts.push(0);
-		parts[3] += 1;
-		return parts.slice(0, 4).join(".");
-	}, [activeSolution?.version, solutionVersion]);
-
-	React.useEffect(() => {
-		setSolutionVersion(activeSolution?.version ?? "1.0.0.0");
-	}, [activeSolution?.version]);
-
-	const toggleEntity = (logicalName: string) => {
-		setSelectedEntities((prev) =>
-			prev.includes(logicalName)
-				? prev.filter((entityName) => entityName !== logicalName)
-				: [...prev, logicalName],
-		);
-	};
-
-	const setTargetStatus = (status: PublishStatus) => {
-		setStatusMap((prev) => {
-			const next = { ...prev };
-			for (const entityName of selectedEntities) next[entityName] = status;
-			if (includeApplicationRibbon) next.Application = status;
-			return next;
-		});
-	};
-
-	const handlePublish = async (mode: "publish" | "save") => {
-		if (!activeSolution) return;
-		setPublishing(true);
-		setProgressMessage("");
-		setErrorMessages([]);
-
-		const initial: Record<string, PublishStatus> = {};
-		selectedEntities.forEach((entityName) => (initial[entityName] = "pending"));
-		if (includeApplicationRibbon) initial.Application = "pending";
-		setStatusMap(initial);
-
-		let hadError = false;
-		const errors: { scope: string; message: string }[] = [];
-		const logs = useRuntimeLogStore.getState();
-		const fmt = (e: unknown) => (e instanceof Error ? e.message : String(e));
-
-		if (activeEntity && selectedEntities.includes(activeEntity.logicalName)) {
-			setStatusMap((prev) => ({ ...prev, [activeEntity.logicalName]: "publishing" }));
-			// Skip scopes that have no diff vs. baseline. Otherwise we round-trip
-			// an empty RibbonDiffXml through the import pipeline and risk a
-			// failure on a scope the user never touched.
-			const entityScopesWithChanges = (["HomepageGrid", "SubGrid", "Form"] as const).filter(
-				(loc) => summarizeRibbonDiff(ribbons[loc], baseline[loc]).hasAnyChange,
-			);
-			if (entityScopesWithChanges.length === 0) {
-				logs.logInfo(
-					"publish",
-					`Entity ribbon publish skipped (${activeEntity.logicalName}) — no changes vs. baseline.`,
-				);
-				setStatusMap((prev) => ({ ...prev, [activeEntity.logicalName]: "success" }));
-			} else {
-				try {
-					for (const location of entityScopesWithChanges) {
-						logs.logInfo(
-							"publish",
-							`Publishing ${location} ribbon for ${activeEntity.logicalName}…`,
-						);
-						await publishRibbon(
-							{
-								current: ribbons[location],
-								baseline: baseline[location],
-								commands,
-								displayRules,
-								enableRules,
-								locLabels,
-								entityLogicalName: activeEntity.logicalName,
-								solutionUniqueName: activeSolution.uniqueName,
-								publisherUniqueName: activeSolution.publisherUniqueName,
-								publisherName: activeSolution.publisherName,
-								publisherPrefix: activeSolution.publisherPrefix || publisherPrefix,
-								solutionVersion: incrementSolutionVersion ? nextVersion : solutionVersion,
-								publishCustomizations: false,
-							},
-							(msg) => setProgressMessage(msg),
-						);
-					}
-					setStatusMap((prev) => ({ ...prev, [activeEntity.logicalName]: "success" }));
-				} catch (err) {
-					hadError = true;
-					const message = fmt(err);
-					errors.push({ scope: activeEntity.logicalName, message });
-					logs.logError(
-						"publish",
-						`Entity ribbon publish failed (${activeEntity.logicalName}): ${message}`,
-					);
-					setStatusMap((prev) => ({ ...prev, [activeEntity.logicalName]: "error" }));
-				}
-			}
-		}
-
-		if (includeApplicationRibbon) {
-			// Skip Application-ribbon publish entirely if the user hasn't actually
-			// touched it. The previous behavior published a synthetic empty diff
-			// every time, which (a) was wasteful and (b) surfaced unrelated
-			// errors like 0x8004803a (component-type-50 not declared) on the
-			// Application path even when the user only edited an entity ribbon.
-			const appSummary = summarizeRibbonDiff(ribbons.Application, baseline.Application);
-			if (!appSummary.hasAnyChange) {
-				logs.logInfo("publish", "Application ribbon publish skipped — no changes vs. baseline.");
-				setStatusMap((prev) => ({ ...prev, Application: "success" }));
-			} else {
-				setStatusMap((prev) => ({ ...prev, Application: "publishing" }));
-				try {
-					await publishRibbon(
-						{
-							current: ribbons.Application,
-							baseline: baseline.Application,
-							commands,
-							displayRules,
-							enableRules,
-							locLabels,
-							entityLogicalName: "{!EntityLogicalName}",
-							solutionUniqueName: activeSolution.uniqueName,
-							publisherUniqueName: activeSolution.publisherUniqueName,
-							publisherName: activeSolution.publisherName,
-							publisherPrefix: activeSolution.publisherPrefix || publisherPrefix,
-							solutionVersion: incrementSolutionVersion ? nextVersion : solutionVersion,
-							ribbonCustomizationIds: solutionRibbonComponentIds ?? [],
-							publishCustomizations: false,
-						},
-						(msg) => setProgressMessage(msg),
-					);
-					setStatusMap((prev) => ({ ...prev, Application: "success" }));
-				} catch (err) {
-					hadError = true;
-					const message = fmt(err);
-					errors.push({ scope: "Application ribbon", message });
-					logs.logError("publish", `Application ribbon publish failed: ${message}`);
-					setStatusMap((prev) => ({ ...prev, Application: "error" }));
-				}
-			}
-		}
-
-		if (mode === "publish" && !hadError) {
-			try {
-				setTargetStatus("publishing");
-				if (publishStrategy === "targeted") {
-					await publishUsingPublishXml(
-						{
-							entityLogicalNames: selectedEntities,
-							includeApplicationRibbon,
-							publishDependencies,
-						},
-						(msg) => setProgressMessage(msg),
-					);
-				} else {
-					await publishAllAsync((msg) => setProgressMessage(msg));
-				}
-				setTargetStatus("success");
-				markPublished();
-			} catch (err) {
-				hadError = true;
-				const message = fmt(err);
-				errors.push({ scope: "Publish customizations", message });
-				logs.logError("publish", `Publish customizations failed: ${message}`);
-				setTargetStatus("error");
-			}
-		}
-
-		setErrorMessages(errors);
-		setDone(!hadError);
-		setPublishing(false);
-		void publishComment;
-	};
-
-	const handleClose = () => {
-		setPublishing(false);
-		setStatusMap({});
-		setDone(false);
-		setProgressMessage("");
-		setErrorMessages([]);
-		closeBulkPublish();
-	};
+	const {
+		bulkPublishOpen, closeBulkPublish, openXmlDrawer,
+		activeSolution, activeEntity, entities, selectedEntities,
+		selectLoadedEntity, deselectAll, toggleEntity,
+		includeApplicationRibbon, setIncludeApplicationRibbon, solutionSupportsAppRibbon, applicationEdited,
+		publishing, statusMap, done, incrementSolutionVersion, setIncrementSolutionVersion,
+		publishStrategy, selectStrategy, supportsAllAsync, globalConsent, setGlobalConsent,
+		progressMessage, publishComment, setPublishComment, solutionVersion, setSolutionVersion, nextVersion,
+		errorMessages, mutationsSincePublish, outcome, recovery, importJobId, downloadRecovery,
+		reason, canPublish, canDownload, handlePublish, handleClose,
+	} = useRibbonPublishController();
 
 	return (
-		<Dialog open={bulkPublishOpen} onOpenChange={() => !publishing && handleClose()}>
+			<Dialog open={bulkPublishOpen} onOpenChange={(_, data) => { if (!data.open && !publishing) handleClose(); }}>
 			<DialogSurface
 				style={{
 					maxWidth: "640px",
@@ -322,8 +95,8 @@ export const BulkPublishModal: React.FC = () => {
 
 							<MessageBar intent="info">
 								<MessageBarBody>
-									Publishing typically takes 5-30 seconds per table. Open users will see the updated
-									ribbon on next page load. You have <strong>{mutationsSincePublish}</strong>{" "}
+										The selected workspace is verified before any import. Changes appear after a Dynamics
+										page reload. You have <strong>{mutationsSincePublish}</strong>{" "}
 									change(s) since last publish.
 								</MessageBarBody>
 							</MessageBar>
@@ -345,9 +118,15 @@ export const BulkPublishModal: React.FC = () => {
 										<div style={{ marginTop: tokens.spacingVerticalS }}>
 											Full details are in the <strong>Console</strong> tab of the bottom panel.
 										</div>
-									</MessageBarBody>
-								</MessageBar>
-							)}
+										</MessageBarBody>
+									</MessageBar>
+								)}
+
+								{reason && (
+									<MessageBar intent="warning">
+										<MessageBarBody>{reason}</MessageBarBody>
+									</MessageBar>
+								)}
 
 							{!publishing && !done && (
 								<>
@@ -356,16 +135,15 @@ export const BulkPublishModal: React.FC = () => {
 										<Button
 											appearance="subtle"
 											size="small"
-											onClick={() =>
-												setSelectedEntities(entities.map((entity) => entity.logicalName))
-											}
+												onClick={selectLoadedEntity}
+												title="Select only the table loaded in this editor workspace"
 										>
 											Select all
 										</Button>
 										<Button
 											appearance="subtle"
 											size="small"
-											onClick={() => setSelectedEntities([])}
+												onClick={deselectAll}
 										>
 											Deselect all
 										</Button>
@@ -375,18 +153,28 @@ export const BulkPublishModal: React.FC = () => {
 											<Checkbox
 												key={entity.logicalName}
 												label={`${entity.displayName || entity.logicalName} (${entity.logicalName})`}
-												checked={selectedEntities.includes(entity.logicalName)}
-												onChange={() => toggleEntity(entity.logicalName)}
+													checked={selectedEntities.includes(entity.logicalName)}
+													disabled={entity.logicalName !== activeEntity?.logicalName}
+													title={entity.logicalName !== activeEntity?.logicalName ? "Load this table in the editor before publishing it" : undefined}
+													onChange={() => toggleEntity(entity.logicalName)}
 											/>
-										))}
-									</div>
+											))}
+										</div>
+										<Text size={100} style={{ color: tokens.colorNeutralForeground3 }}>
+											Other tables remain visible but cannot be published until loaded in this workspace.
+										</Text>
 									<div>
 										<Checkbox
 											label="Include Application Ribbon"
 											checked={includeApplicationRibbon && solutionSupportsAppRibbon}
-											disabled={!solutionSupportsAppRibbon}
-											onChange={(_, d) => setIncludeApplicationRibbon(d.checked === true)}
-										/>
+												disabled={!solutionSupportsAppRibbon || publishing}
+												onChange={(_, d) => setIncludeApplicationRibbon(d.checked === true)}
+											/>
+											{applicationEdited && !includeApplicationRibbon && (
+												<Text size={100} style={{ color: tokens.colorNeutralForeground3 }}>
+													Application ribbon edits require explicitly selecting Include Application Ribbon.
+												</Text>
+											)}
 										{!solutionSupportsAppRibbon && (
 											<Text
 												size={100}
@@ -405,49 +193,78 @@ export const BulkPublishModal: React.FC = () => {
 									</div>
 									<Field label="Publish strategy">
 										<Dropdown
-											selectedOptions={[publishStrategy]}
-											onOptionSelect={(_, data) => {
-												if (data.optionValue === "targeted" || data.optionValue === "allAsync") {
-													setPublishStrategy(data.optionValue);
+												selectedOptions={[publishStrategy]}
+												disabled={publishing}
+												onOptionSelect={(_, data) => {
+													if (data.optionValue === "targeted" || data.optionValue === "allAsync") {
+														selectStrategy(data.optionValue);
 												}
 											}}
 										>
 											<Option value="targeted">Targeted publish (PublishXml)</Option>
-											<Option value="allAsync">Async publish all (PublishAllXmlAsync)</Option>
-										</Dropdown>
-									</Field>
+												<Option value="allAsync" disabled={!supportsAllAsync}>Async publish all (PublishAllXmlAsync)</Option>
+											</Dropdown>
+										</Field>
+										{!supportsAllAsync && (
+											<Text size={100} style={{ color: tokens.colorNeutralForeground3 }}>
+												Asynchronous publish all is unavailable in this organization.
+											</Text>
+										)}
 									<MessageBar intent="info">
 										<MessageBarBody>
 											{publishStrategy === "targeted"
-												? "Targeted mode publishes selected tables/components using PublishXml."
-												: "Async mode runs PublishAllXmlAsync and tracks the background system job."}
-										</MessageBarBody>
-									</MessageBar>
+													? "Targeted mode publishes the loaded table and explicitly included Application ribbon using PublishXml."
+													: "Async mode runs PublishAllXmlAsync and tracks the background system job."}
+											</MessageBarBody>
+										</MessageBar>
+										{publishStrategy === "allAsync" && (
+											<>
+												<MessageBar intent="warning">
+													<MessageBarBody>
+														<strong>Organization-wide scope:</strong> This publishes all customizations, including unrelated solutions and tables.
+													</MessageBarBody>
+												</MessageBar>
+												<Checkbox
+													label="I understand this publishes all customizations in the organization"
+													checked={globalConsent}
+													disabled={publishing}
+													onChange={(_, d) => setGlobalConsent(d.checked === true)}
+												/>
+											</>
+										)}
 									<Field label="Solution version">
 										<Input
 											size="small"
 											value={incrementSolutionVersion ? nextVersion : solutionVersion}
 											onChange={(_, d) => setSolutionVersion(d.value)}
-											disabled={incrementSolutionVersion}
+												disabled={incrementSolutionVersion || publishing}
 										/>
 									</Field>
 									<Switch
 										label="Increment solution version"
-										checked={incrementSolutionVersion}
-										onChange={(_, d) => setIncrementSolutionVersion(d.checked === true)}
+											checked={incrementSolutionVersion}
+											disabled={publishing}
+											onChange={(_, d) => setIncrementSolutionVersion(d.checked === true)}
 									/>
-									<Checkbox
-										label="Publish dependencies (commands, rules, web resources)"
-										checked={publishDependencies}
-										onChange={(_, d) => setPublishDependencies(d.checked === true)}
-									/>
+										<Checkbox
+											label="Publish dependencies (commands, rules, web resources)"
+											checked={false}
+											disabled
+											title="No broad dependency publish. Referenced ribbon commands and rules are included in the scoped ZIP."
+										/>
+										<Text size={100} style={{ color: tokens.colorNeutralForeground3 }}>
+											The scoped ZIP includes ribbon commands and rules; unrelated web resources are not published automatically.
+										</Text>
 									<Field label="Publish comment">
 										<Textarea
 											resize="vertical"
 											value={publishComment}
 											onChange={(_, d) => setPublishComment(d.value)}
 										/>
-									</Field>
+										</Field>
+										<Text size={100} style={{ color: tokens.colorNeutralForeground3 }}>
+											This comment is a local note; it is not sent to Dataverse by the ribbon publishing API.
+										</Text>
 									<Button
 										appearance="subtle"
 										onClick={() => {
@@ -480,7 +297,7 @@ export const BulkPublishModal: React.FC = () => {
 														}
 														size="small"
 													>
-														{status}
+															{outcome === "downloaded" && status === "success" ? "downloaded" : status}
 													</Badge>
 													<Text>{target}</Text>
 													{status === "publishing" && (
@@ -495,8 +312,21 @@ export const BulkPublishModal: React.FC = () => {
 											<MessageBarBody>{progressMessage}</MessageBarBody>
 										</MessageBar>
 									)}
-								</div>
-							)}
+										</div>
+								)}
+
+								{recovery && (
+									<MessageBar intent="info">
+										<MessageBarBody>
+											<strong>Pre-change recovery ZIP available:</strong> {recovery.solutionUniqueName} / {recovery.entityLogicalName}
+											{" "}({recovery.organizationUrl}). Keep this package for manual recovery; it is never imported automatically.
+											<Button appearance="secondary" size="small" disabled={publishing} onClick={downloadRecovery}>
+												Download recovery ZIP
+											</Button>
+										</MessageBarBody>
+									</MessageBar>
+								)}
+								{importJobId && <Text size={100}>Import job: {importJobId}</Text>}
 						</div>
 					</DialogContent>
 					<DialogActions>
@@ -508,22 +338,15 @@ export const BulkPublishModal: React.FC = () => {
 								<Button
 									appearance="secondary"
 									onClick={() => void handlePublish("save")}
-									disabled={
-										publishing ||
-										(selectedEntities.length === 0 && !includeApplicationRibbon) ||
-										!activeSolution
-									}
-								>
-									Save only
+										disabled={!canDownload}
+										title="Prepare and download a local solution ZIP. Does not import or publish anything to the server."
+									>
+										Save ZIP locally
 								</Button>
 								<Button
 									appearance="primary"
 									onClick={() => void handlePublish("publish")}
-									disabled={
-										publishing ||
-										(selectedEntities.length === 0 && !includeApplicationRibbon) ||
-										!activeSolution
-									}
+										disabled={!canPublish}
 								>
 									{publishing
 										? "Publishing..."

@@ -25,7 +25,8 @@ import { useRibbonStore } from "@/store/ribbonStore";
 import { useSelectionStore } from "@/store/selectionStore";
 import { useSessionStore } from "@/store/sessionStore";
 import { useRuntimeLogStore } from "@/store/runtimeLogStore";
-import FluentIcon, { fluentIconToSvg } from "@/components/shared/FluentIcon";
+import FluentIcon from "@/components/shared/FluentIcon";
+import { fluentIconToSvg } from "@/utils/fluentIconSvg";
 import {
 	loadWebResources,
 	saveWebResource,

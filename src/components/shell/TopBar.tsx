@@ -374,7 +374,7 @@ export function TopBar() {
 
 			<div className={styles.sep} />
 
-			<Button appearance="secondary" size="small" icon={<SaveRegular />}>
+			<Button appearance="secondary" size="small" icon={<SaveRegular />} onClick={openBulkPublish}>
 				Save
 			</Button>
 			<Button

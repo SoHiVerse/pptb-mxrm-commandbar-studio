@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- Separate native Dynamics 365 CE on-premises v9.1 HTML-web-resource entry,
+  authenticated same-origin Web API facade, positive optional-capability detection,
+  relative Vite build and deterministic installable solution packaging.
+- Complete unmanaged ribbon preservation, pre-import conflict checks, narrow
+  coherent imports, verified stored/compiled read-back and pre-change recovery ZIPs.
+- Source-bound versioned drafts, per-user storage identity and protection against
+  stale publication completion after reload. Unavailable source blocks publication,
+  not the original client-side editor.
+
+### Fixed
+
+- Restored the upstream CBS canvas topology and original publish/import/XML/diff
+  dialog layouts; safe operations remain behind the existing interface.
+- Native exported entity schema casing (for example `Account` versus logical `account`), missing
+  compiled LocLabels supplied from the original exported source, and authenticated
+  CRM web-resource images rendered in the existing Fluent icon frame.
+- Native contextual SubGrid tabs, no-edit comparisons that previously reported
+  formatting/header changes, and orderly Monaco diff-model disposal on drawer close.
+
+- Correct entity child-`Name` solution XML and preservation of the original
+  publisher, including its option-value prefix.
+- Command/rule-only changes, intentional ordering and visibility changes,
+  unwanted OOB command redefinition, definition-reference parsing and action order.
+- Preservation of nested/unknown XML during unrelated edits and complete
+  replacement of intentionally edited command/rule definitions.
+- Repeated-publish source-cache rebasing, later-edit dirty-state retention,
+  undo/redo of definition edits and draft restoration without replacing the baseline.
+- Safe XML import as an atomic editor mutation and complete unmanaged XML previews.
+- Explicit test/build configuration and the lint configuration's undeclared
+  `typescript-eslint` meta-package import, using the already declared parser/plugin.
+
+### Safety and scope
+
+- No implicit publish-all fallback or automatic retry/rollback of uncertain imports.
+- Unsupported authored Power Fx/Custom API and per-systemform ribbon publication
+  fail before writes; the entity-level Form ribbon remains supported.
+- See `docs/onpremises-verification.md` for the reproducible validation checklist.
+
+---
+
 ## [0.5.0] - 2026-07-16
 
 ### 🎉 First Beta Release
@@ -96,4 +140,3 @@ classic ribbon / command bar customizations, running inside Power Platform ToolB
 
 - Project initialization with Vite + React 18 + TypeScript 5 + Fluent UI v9
 - Shell layout, ribbon canvas stubs, Zustand stores, XML generator/parser scaffolding
-

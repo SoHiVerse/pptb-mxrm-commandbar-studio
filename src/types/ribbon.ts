@@ -32,6 +32,8 @@ export type RibbonOrigin = "oob" | "managed" | "unmanaged";
 
 export interface RibbonButton {
 	id: string;
+	/** Raw merged control XML. Preserves extension attributes and nested menus on an edit. */
+	sourceXml?: string;
 	label: string;
 	tooltipTitle?: string;
 	tooltipBody?: string;
@@ -56,6 +58,8 @@ export interface RibbonButton {
 
 export interface RibbonGroup {
 	id: string;
+	/** Original group subtree, including elements the visual model cannot represent. */
+	sourceXml?: string;
 	label: string;
 	sequence: number;
 	template: string;
@@ -64,6 +68,8 @@ export interface RibbonGroup {
 
 export interface RibbonTab {
 	id: string;
+	/** Original tab subtree. Do not regenerate unknown children from the visual model. */
+	sourceXml?: string;
 	label: string;
 	sequence: number;
 	commandId?: string;
@@ -82,6 +88,8 @@ export interface RibbonDefinition {
 
 export interface CommandDefinition {
 	id: string;
+	/** Original command XML, including unsupported action/extensions for safe comparisons. */
+	sourceXml?: string;
 	enableRules: string[];
 	displayRules: string[];
 	actions: RibbonAction[];
@@ -153,11 +161,13 @@ export type CrmParameterValue =
 
 export interface EnableRule {
 	id: string;
+	sourceXml?: string;
 	steps: RuleStep[];
 }
 
 export interface DisplayRule {
 	id: string;
+	sourceXml?: string;
 	steps: RuleStep[];
 }
 
@@ -357,6 +367,7 @@ export type EntityProperty =
 
 export interface TabDisplayRule {
 	tabCommand: string;
+	sourceXml?: string;
 	rules: TabDisplayRuleStep[];
 }
 
@@ -371,11 +382,13 @@ export type TabDisplayRuleStep =
 
 export interface LocLabel {
 	id: string;
+	sourceXml?: string;
 	titles: { languageCode: number; description: string }[];
 }
 
 export interface ScalingDefinition {
 	tabId: string;
+	sourceXml?: string;
 	maxSizes: ScaleStep[];
 	scales: ScaleStep[];
 }

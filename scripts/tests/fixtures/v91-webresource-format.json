@@ -1,0 +1,46 @@
+{
+  "source": "Sanitized structural observation of a disposable Dynamics 365 CE on-premises v9.1 unmanaged solution export on 2026-10-15. No organization identifiers, publisher identifiers or original component GUIDs retained.",
+  "customizationsRootNodesInOrder": [
+    "Entities",
+    "Roles",
+    "Workflows",
+    "FieldSecurityProfiles",
+    "Templates",
+    "EntityMaps",
+    "EntityRelationships",
+    "OrganizationSettings",
+    "optionsets",
+    "WebResources",
+    "CustomControls",
+    "EntityDataProviders",
+    "Languages"
+  ],
+  "webResourceFieldsInOrder": [
+    "WebResourceId",
+    "Name",
+    "DisplayName",
+    "WebResourceType",
+    "IntroducedVersion",
+    "IsEnabledForMobileClient",
+    "IsAvailableForMobileOffline",
+    "IsCustomizable",
+    "CanBeDeleted",
+    "IsHidden",
+    "FileName"
+  ],
+  "solutionRootComponent": {
+    "type": "61",
+    "schemaName": "sample_/schema/sample.html",
+    "behavior": "0"
+  },
+  "webResourcePathExample": {
+    "logicalName": "sample_/schema/sample.html",
+    "componentId": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "zipPart": "WebResources/sample_schemasamplehtmlAAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
+  },
+  "contentTypes": {
+    "defaultExtension": "xml",
+    "defaultType": "application/octet-stream",
+    "binaryPartOverrideType": "application/octet-stream"
+  }
+}

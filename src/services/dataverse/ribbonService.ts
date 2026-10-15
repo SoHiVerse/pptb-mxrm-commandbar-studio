@@ -27,7 +27,7 @@ function dedupeById<T extends { id: string }>(items: T[]): T[] {
 }
 
 /**
- * Splits the merged entity-ribbon tabs into the three EntityRibbonLocation
+ * Splits an already-merged entity ribbon into the three EntityRibbonLocation
  * buckets based on the Microsoft tab-ID naming convention documented at
  * https://learn.microsoft.com/en-us/power-apps/developer/model-driven-apps/ribbons-available:
  *   - Mscrm.Form.<entity>.*        → Form
@@ -36,10 +36,12 @@ function dedupeById<T extends { id: string }>(items: T[]): T[] {
  *
  * Tabs without a recognized prefix default to HomepageGrid (most common
  * fallback for custom tabs). This may need to be refined once we observe
- * real customer ribbon shapes in PPTB.
+ * real customer ribbon shapes in PPTB. Live CRM loading does not use this
+ * helper: valid publisher-prefixed Form/SubGrid tabs cannot be classified by
+ * their IDs, so the server's location filter is authoritative instead.
  */
-function splitTabsByLocation(
-	tabs: RibbonTab[],
+export function splitTabsByLocation(
+	ribbon: RibbonDefinition,
 	entityLogicalName: string,
 ): Record<EntityRibbonLocation, RibbonDefinition> {
 	const buckets: Record<EntityRibbonLocation, RibbonTab[]> = {
@@ -48,7 +50,7 @@ function splitTabsByLocation(
 		Form: [],
 	};
 
-	for (const tab of tabs) {
+	for (const tab of ribbon.tabs) {
 		if (tab.id.startsWith("Mscrm.Form.")) {
 			buckets.Form.push(tab);
 		} else if (tab.id.startsWith("Mscrm.SubGrid.")) {
@@ -62,16 +64,26 @@ function splitTabsByLocation(
 		}
 	}
 
-	return {
-		HomepageGrid: { location: "HomepageGrid", entityLogicalName, tabs: buckets.HomepageGrid },
-		SubGrid: { location: "SubGrid", entityLogicalName, tabs: buckets.SubGrid },
-		Form: { location: "Form", entityLogicalName, tabs: buckets.Form },
-	};
+	const result = {} as Record<EntityRibbonLocation, RibbonDefinition>;
+	for (const location of ["HomepageGrid", "SubGrid", "Form"] as const) {
+		const locationTabs = buckets[location];
+		const ownedTabIds = new Set(locationTabs.map((tab) => tab.id));
+		const scalings = Object.fromEntries(
+			Object.entries(ribbon.scalingByTab ?? {}).filter(([tabId]) => ownedTabIds.has(tabId)),
+		);
+		result[location] = {
+			location,
+			entityLogicalName,
+			tabs: locationTabs,
+			...(Object.keys(scalings).length ? { scalingByTab: scalings } : {}),
+		};
+	}
+	return result;
 }
 
 /**
- * Retrieves the merged ribbon XML for an entity (all locations) and splits it
- * into HomepageGrid/SubGrid/Form ribbon definitions.
+ * Retrieves the three entity ribbon locations individually and uses each
+ * server-requested scope as authoritative for its custom/publisher tab IDs.
  *
  * Implementation note — Dataverse Web API enum parameter encoding:
  *
@@ -89,11 +101,14 @@ function splitTabsByLocation(
  * Edm.String single-quote wrapping that ordinary strings receive. So we pass
  * the full type-qualified string and PPTB does the right thing.
  *
- * We use `'All'` (= 7, equivalent to Form | HomepageGrid | SubGrid) to fetch
- * the merged ribbon in a single call, then split by tab-ID prefix below.
+ * Individual Form, HomepageGrid and SubGrid filters were verified against
+ * Dynamics 365 CE on-premises v9.1. The combined 'All' result cannot
+ * reliably classify publisher-prefixed controls into their ribbon locations.
  * Reference: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/webapi/reference/ribbonlocationfilters
  */
-const RIBBON_LOCATION_FILTER_ALL = "Microsoft.Dynamics.CRM.RibbonLocationFilters'All'";
+const ENTITY_RIBBON_LOCATIONS = ["HomepageGrid", "SubGrid", "Form"] as const satisfies readonly EntityRibbonLocation[];
+const ribbonLocationFilter = (location: EntityRibbonLocation) =>
+	`Microsoft.Dynamics.CRM.RibbonLocationFilters'${location}'`;
 
 export async function fetchEntityRibbonAllLocations(entityLogicalName: string): Promise<{
 	ribbons: Record<EntityRibbonLocation, RibbonDefinition>;
@@ -102,39 +117,48 @@ export async function fetchEntityRibbonAllLocations(entityLogicalName: string): 
 	enableRules: ReturnType<typeof parseRibbonXml>["enableRules"];
 	locLabels: ReturnType<typeof parseRibbonXml>["locLabels"];
 }> {
-	useRuntimeLogStore
-		.getState()
-		.logInfo("dataverse", `RetrieveEntityRibbon(${entityLogicalName}, All)`);
-	const result = await dataverseAPI.execute({
-		operationName: "RetrieveEntityRibbon",
-		operationType: "function",
-		parameters: {
-			EntityName: entityLogicalName,
-			RibbonLocationFilter: RIBBON_LOCATION_FILTER_ALL,
-		},
-	});
-
-	const xml = await decompressRibbonZip(result.CompressedEntityXml as string);
-	// Parse once with a neutral location; we'll bucket the tabs ourselves below.
-	const parsed = parseRibbonXml(xml, "HomepageGrid", entityLogicalName);
-	const ribbons = splitTabsByLocation(parsed.ribbon.tabs, entityLogicalName);
+	useRuntimeLogStore.getState().logInfo(
+		"dataverse", `RetrieveEntityRibbon(${entityLogicalName}, HomepageGrid/SubGrid/Form)`,
+	);
+	// Three bounded parallel reads; a failed scoped request must fail the whole
+	// workspace load. Falling back to 'All' would silently misclassify tabs.
+	const perLocation = await Promise.all(ENTITY_RIBBON_LOCATIONS.map(async (location) => {
+		const result = await dataverseAPI.execute({
+			operationName: "RetrieveEntityRibbon",
+			operationType: "function",
+			parameters: {
+				EntityName: entityLogicalName,
+				RibbonLocationFilter: ribbonLocationFilter(location),
+			},
+		});
+		if (typeof result?.CompressedEntityXml !== "string") {
+			throw new Error(`RetrieveEntityRibbon(${entityLogicalName}, ${location}) returned no compressed ribbon XML.`);
+		}
+		const xml = await decompressRibbonZip(result.CompressedEntityXml);
+		return { location, parsed: parseRibbonXml(xml, location, entityLogicalName) };
+	}));
+	const ribbons = {} as Record<EntityRibbonLocation, RibbonDefinition>;
+	for (const { location, parsed } of perLocation) ribbons[location] = parsed.ribbon;
 
 	useRuntimeLogStore
 		.getState()
 		.logInfo(
 			"dataverse",
 			`RetrieveEntityRibbon succeeded for ${entityLogicalName} ` +
-				`(Form=${ribbons.Form.tabs.length}, ` +
-				`HomepageGrid=${ribbons.HomepageGrid.tabs.length}, ` +
-				`SubGrid=${ribbons.SubGrid.tabs.length})`,
+			`(Form=${ribbons.Form.tabs.length}, ` +
+			`HomepageGrid=${ribbons.HomepageGrid.tabs.length}, ` +
+			`SubGrid=${ribbons.SubGrid.tabs.length})`,
 		);
 
 	return {
 		ribbons,
-		commands: parsed.commands,
-		displayRules: parsed.displayRules,
-		enableRules: parsed.enableRules,
-		locLabels: parsed.locLabels,
+		// Definitions are shared among locations; a declaration may legitimately
+		// appear in several filtered results, while identical tab IDs can occur in
+		// different scopes and must remain in each ribbon unchanged.
+		commands: dedupeById(perLocation.flatMap(({ parsed }) => parsed.commands)),
+		displayRules: dedupeById(perLocation.flatMap(({ parsed }) => parsed.displayRules)),
+		enableRules: dedupeById(perLocation.flatMap(({ parsed }) => parsed.enableRules)),
+		locLabels: dedupeById(perLocation.flatMap(({ parsed }) => parsed.locLabels)),
 	};
 }
 

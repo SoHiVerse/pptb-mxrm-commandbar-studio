@@ -11,6 +11,22 @@ function loadFixture(name: string): string {
 
 // ── Parsing account-full.xml ───────────────────────────────────────────────
 
+describe("native contextual ribbon tabs", () => {
+	it("loads a SubGrid tab from its server contextual group", () => {
+		const xml = '<RibbonDefinitions><RibbonDefinition><UI><Ribbon><Tabs Id="Mscrm.Tabs"/><ContextualTabs><ContextualGroup Id="Mscrm.SubGrid.lead.ContextualTabs"><Tab Id="Mscrm.SubGrid.lead.MainTab" Title="Leads"><Groups><Group Id="lead.Management" Title="Manage"><Controls><Button Id="test.Reminder" Command="test.ReminderCommand" LabelText="Reminder"/></Controls></Group></Groups></Tab></ContextualGroup></ContextualTabs></Ribbon></UI></RibbonDefinition></RibbonDefinitions>';
+		const { ribbon } = parseRibbonXml(xml, 'SubGrid', 'lead');
+		expect(ribbon.tabs).toHaveLength(1);
+		expect(ribbon.tabs[0].id).toBe('Mscrm.SubGrid.lead.MainTab');
+		expect(ribbon.tabs[0].groups[0].buttons[0].label).toBe('Reminder');
+	});
+
+	it("does not treat an embedded contextual override declaration as another rendered tab", () => {
+		const tab = '<ContextualTabs><ContextualGroup Id="group"><Tab Id="tab" Title="Tab"><Groups/></Tab></ContextualGroup></ContextualTabs>';
+		const { ribbon } = parseRibbonXml(`<Ribbon>${tab}<CustomActions><CustomAction Id="override"><CommandUIDefinition>${tab}</CommandUIDefinition></CustomAction></CustomActions></Ribbon>`, 'SubGrid', 'lead');
+		expect(ribbon.tabs).toHaveLength(1);
+	});
+});
+
 describe("parseRibbonXml — account entity", () => {
 	const xml = loadFixture("account-full.xml");
 
@@ -107,6 +123,29 @@ describe("parseRibbonXml — provenance heuristic", () => {
 		const oob = findButton(ribbon, "Mscrm.Form.account.MainTab.Save.SavePrimary");
 		expect(oob?.oob).toBe(true);
 		expect(oob?.origin).toBe("oob");
+	});
+});
+
+describe("parseRibbonXml — numeric boolean action arguments", () => {
+	it("treats BoolParameter Value=1 as true without losing argument order", () => {
+		const xml = `<RibbonDefinitions><CommandDefinitions><CommandDefinition Id="Custom.C"><EnableRules/><DisplayRules/><Actions><JavaScriptFunction Library="$webresource:custom_/x.js" FunctionName="Run"><BoolParameter Value="1"/><BoolParameter Value="0"/><StringParameter Value="last"/></JavaScriptFunction></Actions></CommandDefinition></CommandDefinitions></RibbonDefinitions>`;
+		const command = parseRibbonXml(xml, "Form", "account").commands[0];
+		expect(command.actions[0].kind).toBe("javascript");
+		if (command.actions[0].kind !== "javascript") throw new Error("Expected JavaScript action");
+		expect(command.actions[0].params).toEqual([
+			{ kind: "BoolParameter", name: undefined, value: true },
+			{ kind: "BoolParameter", name: undefined, value: false },
+			{ kind: "StringParameter", name: undefined, value: "last" },
+		]);
+	});
+});
+
+describe("parseRibbonXml — structural declaration scoping", () => {
+	it("does not create duplicate displayed tabs from CustomAction-nested Tab declarations", () => {
+		const xml = `<RibbonDefinitions><Ribbon><Tabs><Tab Id="T" Title="First"><Groups><Group Id="G" Label="Main"><Controls/></Group></Groups></Tab></Tabs></Ribbon><CustomActions><CustomAction Id="override" Location="Mscrm.Tabs._children"><CommandUIDefinition><Ribbon><Tabs><Tab Id="T" Title="Nested duplicate"><Groups><Group Id="Other" Label="Other"><Controls/></Group></Groups></Tab></Tabs></Ribbon></CommandUIDefinition></CustomAction></CustomActions></RibbonDefinitions>`;
+		const result = parseRibbonXml(xml, "Form", "account");
+		expect(result.ribbon.tabs.map(tab => tab.id)).toEqual(["T"]);
+		expect(result.ribbon.tabs[0].groups.map(group => group.id)).toEqual(["G"]);
 	});
 });
 

@@ -29,3 +29,8 @@ npm-shrinkwrap.json
 
 # Release-it temp files
 .release-it*
+# Native output and private, organization-specific acceptance evidence.
+dist-onprem/
+dist-onprem-package/
+.cbs-probe/
+.superpowers/

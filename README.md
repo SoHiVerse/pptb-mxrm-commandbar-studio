@@ -8,7 +8,7 @@ reimagined with React 18, Fluent UI v9, and live Dataverse integration via
 The same editor also has a **native Dynamics 365 CE on-premises v9.1** build,
 hosted as CRM HTML web resources using the existing signed-in browser session.
 See [native deployment and packaging](docs/onpremises.md) and
-[verification status](docs/onpremises-verification.md). The PPTB entry remains
+[verification checklist](docs/onpremises-verification.md). The PPTB entry remains
 separate; native hosting does not change authentication in the PPTB desktop host.
 
 ![Version](https://img.shields.io/badge/version-0.5.3--beta.1-orange)

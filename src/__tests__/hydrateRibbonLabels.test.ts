@@ -3,22 +3,22 @@ import { parseRibbonXml } from "@/services/xmlParser";
 import { hydrateRibbonLabels } from "@/services/hydrateRibbonLabels";
 import type { RibbonSourceSnapshot, RibbonWorkspace } from "@/types/workspace";
 
-const LABEL = "Lead.Appo.Btn.Home.LabelText";
+const LABEL = "Sample.Ribbon.Home.ReviewLabel";
 const entityXml = `<RibbonDiffXml><LocLabels>
   <LocLabel Id="${LABEL}"><Titles>
-    <Title languagecode="1033" description="Set Reminder"/>
-    <Title languagecode="1065" description="تنظیم یادآوری"/>
+    <Title languagecode="1033" description="Review Record"/>
+    <Title languagecode="1065" description="بررسی رکورد"/>
   </Titles></LocLabel>
-  <LocLabel Id="Lead.Tab.Title"><Titles><Title languagecode="1033" description="My Leads"/></Titles></LocLabel>
-  <LocLabel Id="Lead.Group.Title"><Titles><Title languagecode="1033" description="Lead Actions"/></Titles></LocLabel>
-  <LocLabel Id="Lead.Tooltip.Title"><Titles><Title languagecode="1033" description="Reminder actions"/></Titles></LocLabel>
-  <LocLabel Id="Lead.Tooltip.Body"><Titles><Title languagecode="1033" description="Schedule a reminder"/></Titles></LocLabel>
+  <LocLabel Id="Sample.Tab.Title"><Titles><Title languagecode="1033" description="Sample Records"/></Titles></LocLabel>
+  <LocLabel Id="Sample.Group.Title"><Titles><Title languagecode="1033" description="Record Actions"/></Titles></LocLabel>
+  <LocLabel Id="Sample.Tooltip.Title"><Titles><Title languagecode="1033" description="Review this record"/></Titles></LocLabel>
+  <LocLabel Id="Sample.Tooltip.Body"><Titles><Title languagecode="1033" description="Open the record review"/></Titles></LocLabel>
 </LocLabels></RibbonDiffXml>`;
 
 const appXml = `<RibbonDiffXml><LocLabels>
   <LocLabel Id="${LABEL}"><Titles>
     <Title languagecode="1033" description="Wrong global label"/>
-    <Title languagecode="1031" description="Erinnerung planen"/>
+    <Title languagecode="1031" description="Datensatz prüfen"/>
   </Titles></LocLabel>
   <LocLabel Id="Application.Only"><Titles>
     <Title languagecode="1033" description="Application Command"/>
@@ -26,20 +26,20 @@ const appXml = `<RibbonDiffXml><LocLabels>
   </Titles></LocLabel>
 </LocLabels></RibbonDiffXml>`;
 
-const mergedLeadXml = `<RibbonDefinitions><RibbonDefinition><Tabs>
-  <Tab Id="Lead.Home.Tab" Title="$LocLabels:Lead.Tab.Title" Sequence="10">
-    <Groups><Group Id="Lead.Group" Title="$LocLabels:Lead.Group.Title" Sequence="10">
+const mergedSampleXml = `<RibbonDefinitions><RibbonDefinition><Tabs>
+  <Tab Id="Sample.Home.Tab" Title="$LocLabels:Sample.Tab.Title" Sequence="10">
+    <Groups><Group Id="Sample.Group" Title="$LocLabels:Sample.Group.Title" Sequence="10">
       <Controls>
-        <Button Id="Lead.Home.Reminder" LabelText="$LocLabels:${LABEL}"
-          ToolTipTitle="$LocLabels:Lead.Tooltip.Title" ToolTipDescription="$LocLabels:Lead.Tooltip.Body"
-          Sequence="10" TemplateAlias="o1" Command="Lead.Command" />
+        <Button Id="Sample.Home.Review" LabelText="$LocLabels:${LABEL}"
+          ToolTipTitle="$LocLabels:Sample.Tooltip.Title" ToolTipDescription="$LocLabels:Sample.Tooltip.Body"
+          Sequence="10" TemplateAlias="o1" Command="Sample.Command" />
         <Button Id="Mscrm.Save" LabelText="$Resources:Ribbon.HomepageGrid.Save" Sequence="20"/>
       </Controls>
     </Group></Groups>
   </Tab>
-</Tabs></RibbonDefinition><CommandDefinitions><CommandDefinition Id="Lead.Command">
-  <EnableRules><EnableRule Id="Lead.Enabled"/></EnableRules><Actions><JavaScriptFunction Library="$webresource:lead/actions.js" FunctionName="remind"/></Actions>
-</CommandDefinition></CommandDefinitions><RuleDefinitions><EnableRules><EnableRule Id="Lead.Enabled"><SelectionCountRule Minimum="1"/></EnableRule></EnableRules></RuleDefinitions></RibbonDefinitions>`;
+</Tabs></RibbonDefinition><CommandDefinitions><CommandDefinition Id="Sample.Command">
+  <EnableRules><EnableRule Id="Sample.Enabled"/></EnableRules><Actions><JavaScriptFunction Library="$webresource:sample_/actions.js" FunctionName="review"/></Actions>
+</CommandDefinition></CommandDefinitions><RuleDefinitions><EnableRules><EnableRule Id="Sample.Enabled"><SelectionCountRule Minimum="1"/></EnableRule></EnableRules></RuleDefinitions></RibbonDefinitions>`;
 
 const mergedAppXml = `<RibbonDefinitions><RibbonDefinition><Tabs>
   <Tab Id="Mscrm.GlobalTab" Title="Global"><Groups><Group Id="Mscrm.GlobalGroup" Title="Actions">
@@ -48,14 +48,14 @@ const mergedAppXml = `<RibbonDefinitions><RibbonDefinition><Tabs>
 </Tabs></RibbonDefinition></RibbonDefinitions>`;
 
 function workspace(): RibbonWorkspace {
-  const entity = parseRibbonXml(mergedLeadXml, "HomepageGrid", "lead");
+  const entity = parseRibbonXml(mergedSampleXml, "HomepageGrid", "sample");
   const application = parseRibbonXml(mergedAppXml, "Application", "{!EntityLogicalName}");
-  expect(entity.locLabels).toHaveLength(0); // The observed on-prem RetrieveEntityRibbon shape.
+  expect(entity.locLabels).toHaveLength(0); // The merged RetrieveEntityRibbon response can omit LocLabels.
   return {
     ribbons: {
       HomepageGrid: entity.ribbon,
-      SubGrid: { location: "SubGrid", entityLogicalName: "lead", tabs: [] },
-      Form: { location: "Form", entityLogicalName: "lead", tabs: [] },
+      SubGrid: { location: "SubGrid", entityLogicalName: "sample", tabs: [] },
+      Form: { location: "Form", entityLogicalName: "sample", tabs: [] },
       Application: application.ribbon,
     },
     commands: entity.commands,
@@ -67,26 +67,26 @@ function workspace(): RibbonWorkspace {
 
 function source(): RibbonSourceSnapshot {
   return {
-    organizationUrl: "https://crm.example.test/Org", solutionUniqueName: "Ribbon", entityLogicalName: "lead",
+    organizationUrl: "https://example.test/sample-org", solutionUniqueName: "SampleSolution", entityLogicalName: "sample",
     solutionVersion: "1.0.0.0", solutionXml: "<ImportExportXml/>", customizationsXml: "<ImportExportXml/>",
-    entityRibbonXml: entityXml, applicationRibbonXml: appXml, capturedAt: "2026-10-15T01:00:00Z",
+    entityRibbonXml: entityXml, applicationRibbonXml: appXml, capturedAt: "2026-01-01T00:00:00Z",
   };
 }
 
 describe("hydrateRibbonLabels", () => {
-  it("resolves real custom Lead labels and tooltips absent from the merged ribbon", () => {
+  it("resolves custom labels and tooltips absent from a merged ribbon", () => {
     const loaded = workspace();
     const original = structuredClone(loaded);
     expect(loaded.ribbons.HomepageGrid.tabs[0].groups[0].buttons[0].label).toBe(LABEL);
     const hydrated = hydrateRibbonLabels(loaded, source());
     const tab = hydrated.ribbons.HomepageGrid.tabs[0];
     const group = tab.groups[0];
-    const reminder = group.buttons[0];
-    expect(tab.label).toBe("My Leads");
-    expect(group.label).toBe("Lead Actions");
-    expect(reminder.label).toBe("Set Reminder");
-    expect(reminder.tooltipTitle).toBe("Reminder actions");
-    expect(reminder.tooltipBody).toBe("Schedule a reminder");
+    const review = group.buttons[0];
+    expect(tab.label).toBe("Sample Records");
+    expect(group.label).toBe("Record Actions");
+    expect(review.label).toBe("Review Record");
+    expect(review.tooltipTitle).toBe("Review this record");
+    expect(review.tooltipBody).toBe("Open the record review");
     expect(group.buttons[1].label).toBe("Ribbon.HomepageGrid.Save");
     expect(hydrated.ribbons.Application.tabs[0].groups[0].buttons[0].label).toBe("Application Command");
     expect(loaded).toEqual(original); // Pure: the loader's source model is unmodified.
@@ -94,14 +94,14 @@ describe("hydrateRibbonLabels", () => {
 
   it("retains English, Persian, other locales, sourceXml and entity-first translation precedence", () => {
     const hydrated = hydrateRibbonLabels(workspace(), source());
-    const reminder = hydrated.locLabels.find(label => label.id === LABEL)!;
-    expect(reminder.titles).toEqual([
-      { languageCode: 1033, description: "Set Reminder" },
-      { languageCode: 1065, description: "تنظیم یادآوری" },
-      { languageCode: 1031, description: "Erinnerung planen" },
+    const review = hydrated.locLabels.find(label => label.id === LABEL)!;
+    expect(review.titles).toEqual([
+      { languageCode: 1033, description: "Review Record" },
+      { languageCode: 1065, description: "بررسی رکورد" },
+      { languageCode: 1031, description: "Datensatz prüfen" },
     ]);
-    expect(reminder.sourceXml).toContain('<LocLabel Id="Lead.Appo.Btn.Home.LabelText">');
-    expect(reminder.sourceXml).toContain('languagecode="1065"');
+    expect(review.sourceXml).toContain('<LocLabel Id="Sample.Ribbon.Home.ReviewLabel">');
+    expect(review.sourceXml).toContain('languagecode="1065"');
     const global = hydrated.locLabels.find(label => label.id === "Application.Only")!;
     expect(global.titles).toEqual([
       { languageCode: 1033, description: "Application Command" },
@@ -109,7 +109,7 @@ describe("hydrateRibbonLabels", () => {
     ]);
     expect(global.sourceXml).toContain("Application.Only");
     expect(hydrated.locLabels.map(label => label.id)).toEqual([
-      LABEL, "Lead.Tab.Title", "Lead.Group.Title", "Lead.Tooltip.Title", "Lead.Tooltip.Body", "Application.Only",
+      LABEL, "Sample.Tab.Title", "Sample.Group.Title", "Sample.Tooltip.Title", "Sample.Tooltip.Body", "Application.Only",
     ]);
   });
 
@@ -119,15 +119,15 @@ describe("hydrateRibbonLabels", () => {
       sourceXml: '<LocLabel Id="Mscrm.PlatformSave"><Titles><Title languagecode="1033" description="Save"/></Titles></LocLabel>' };
     input.locLabels.push({ id: LABEL, titles: [
       { languageCode: 1033, description: "Stale merged label" },
-      { languageCode: 1041, description: "リマインダー" },
-    ], sourceXml: '<LocLabel Id="Lead.Appo.Btn.Home.LabelText" Origin="Merged"/>' }, platform);
+      { languageCode: 1041, description: "レコードを確認" },
+    ], sourceXml: '<LocLabel Id="Sample.Ribbon.Home.ReviewLabel" Origin="Merged"/>' }, platform);
     const hydrated = hydrateRibbonLabels(input, source());
     const primary = hydrated.locLabels.find(label => label.id === LABEL)!;
     expect(primary.titles).toEqual([
-      { languageCode: 1033, description: "Set Reminder" },
-      { languageCode: 1065, description: "تنظیم یادآوری" },
-      { languageCode: 1031, description: "Erinnerung planen" },
-      { languageCode: 1041, description: "リマインダー" },
+      { languageCode: 1033, description: "Review Record" },
+      { languageCode: 1065, description: "بررسی رکورد" },
+      { languageCode: 1031, description: "Datensatz prüfen" },
+      { languageCode: 1041, description: "レコードを確認" },
     ]);
     expect(primary.sourceXml).not.toContain('Origin="Merged"');
     expect(hydrated.locLabels.find(label => label.id === platform.id)).toEqual(platform);

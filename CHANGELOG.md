@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Restored the upstream CBS canvas topology and original publish/import/XML/diff
   dialog layouts; safe operations remain behind the existing interface.
-- Native exported entity schema casing (`Lead` versus logical `lead`), missing
+- Native exported entity schema casing (for example `Account` versus logical `account`), missing
   compiled LocLabels supplied from the original exported source, and authenticated
   CRM web-resource images rendered in the existing Fluent icon frame.
 - Native contextual SubGrid tabs, no-edit comparisons that previously reported
@@ -47,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - No implicit publish-all fallback or automatic retry/rollback of uncertain imports.
 - Unsupported authored Power Fx/Custom API and per-systemform ribbon publication
   fail before writes; the entity-level Form ribbon remains supported.
-- See `docs/onpremises-verification.md` for exact verification and live acceptance.
+- See `docs/onpremises-verification.md` for the reproducible validation checklist.
 
 ---
 

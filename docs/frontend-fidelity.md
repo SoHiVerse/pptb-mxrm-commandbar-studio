@@ -1,17 +1,16 @@
 # Original CBS frontend, native Dynamics compatibility
 
-The reference frontend is repository commit
-`27128373a3e4af32b81c07511191ada15192bc4f`. The native HTML is a host bootstrap, not
-a separate frontend: it initializes authenticated CRM APIs and dynamically loads
-the same `src/main.tsx` and `src/App.tsx` as the PPTB entry.
+The upstream CBS frontend remains the reference. The native HTML is a host
+bootstrap, not a separate frontend: it initializes authenticated CRM APIs and
+dynamically loads the same `src/main.tsx` and `src/App.tsx` as the PPTB entry.
 
 ## Source parity
 
 The four ribbon-canvas modules (`ClassicRibbon`, `ModernCommandBar`,
 `RibbonListView`, `RibbonCanvas`), shell `Layout`, global CSS, UI preferences,
 properties sections, command editor, rule editor, command palette and the other
-unchanged components are used directly. Across the 44 original component files,
-global CSS and UI store, 39 of 46 files have no diff from the reference commit.
+unchanged components are used directly. The native entry shares the original
+canvas, renderer, layout, styling and editor component modules.
 
 Seven component files have bounded compatibility changes:
 
@@ -32,8 +31,8 @@ or normal client-side editing.
 
 ## Data compatibility, not a redesigned UI
 
-Dynamics 9.1 can export a standard entity as `<Name>Lead</Name>` while its logical
-root component is `lead`; identity matching now accepts schema casing and still
+Dynamics 9.1 can export a standard entity as `<Name>Account</Name>` while its logical
+root component is `account`; identity matching now accepts schema casing and still
 rejects ambiguous duplicates. Its merged ribbon response may contain no LocLabel
 declarations. The source-loading service supplies labels and translations from the
 selected exported unmanaged source before capturing the baseline. Original label
@@ -43,10 +42,10 @@ Built-in `$Resources:` keys that are not supplied as localized label definitions
 still use the upstream CBS fallback in `utils/displayLabel.ts`; no guessed
 translations, fabricated icon mappings or copied replacement UI are introduced.
 
-Read-only acceptance on Lead also verified that native SubGrid tabs are children
-of `ContextualGroup`, rather than direct `Tabs` children. The data parser now
-includes both forms without treating embedded customization declarations as
-rendered tabs. An unchanged preview preserves the exact original XML and uses
+Native SubGrid tabs may be children of `ContextualGroup`, rather than direct
+`Tabs` children. The data parser now includes both forms without treating
+embedded customization declarations as rendered tabs. An unchanged preview
+preserves the exact original XML and uses
 matching comparison headings, avoiding a false change count. The installed
 Monaco React wrapper's diff-model disposal order is handled without replacing
 the original editor or drawer.
@@ -59,4 +58,5 @@ read-back, dirty-state preservation and recovery stay in the service/controller
 layer. Explicitly unavailable server operations are disabled with an explanation,
 not replaced by broader publication.
 
-For local and deployed validation, see `onpremises-verification.md`.
+For reproducible local and deployed validation steps, see
+`onpremises-verification.md`.

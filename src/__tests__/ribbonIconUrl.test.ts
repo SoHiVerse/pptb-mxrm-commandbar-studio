@@ -1,16 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { resolveRibbonIconUrl } from "@/utils/ribbonIconUrl";
 
-const ORG = "https://crm.example.test/Organization";
+const ORG = "https://example.test/sample-org";
 
 describe("resolveRibbonIconUrl", () => {
-	it("resolves real classic-ribbon resources beneath the active organization", () => {
-		expect(resolveRibbonIconUrl("$webresource:Service/_imgs/ribbon/WorkHours.svg", ORG))
-			.toBe(`${ORG}/WebResources/Service/_imgs/ribbon/WorkHours.svg`);
-		expect(resolveRibbonIconUrl("$webresource:Service/_imgs/ribbon/CancelEntitelment_16.png", ORG))
-			.toBe(`${ORG}/WebResources/Service/_imgs/ribbon/CancelEntitelment_16.png`);
-		expect(resolveRibbonIconUrl("$webresource:Activities/Images/SendAsAppointment_16.png", ORG))
-			.toBe(`${ORG}/WebResources/Activities/Images/SendAsAppointment_16.png`);
+	it("resolves nested classic-ribbon resources beneath the active organization", () => {
+		expect(resolveRibbonIconUrl("$webresource:sample_/icons/ribbon/primary.svg", ORG))
+			.toBe(`${ORG}/WebResources/sample_/icons/ribbon/primary.svg`);
+		expect(resolveRibbonIconUrl("$webresource:sample_/icons/ribbon/secondary.png", ORG))
+			.toBe(`${ORG}/WebResources/sample_/icons/ribbon/secondary.png`);
+		expect(resolveRibbonIconUrl("$webresource:sample_/images/appointments/create.png", ORG))
+			.toBe(`${ORG}/WebResources/sample_/images/appointments/create.png`);
 	});
 
 	it("preserves organization virtual-directory prefixes, ports and optional trailing slash", () => {

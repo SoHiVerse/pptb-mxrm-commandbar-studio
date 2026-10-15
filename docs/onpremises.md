@@ -251,5 +251,5 @@ definitions in `customizations.xml` is outside the supported *manual XML
 editing* scenarios. This packager constructs the recognized exported-format
 web-resource entries and validates their references, but only an import test
 against the target version establishes that this generated ZIP is accepted
-in that organization. See the separate live verification record for the
-actual result before distributing a package as field-tested.
+in that organization. Follow the independent verification checklist and keep
+organization-specific acceptance evidence in a private change-control record.

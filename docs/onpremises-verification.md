@@ -1,148 +1,99 @@
-# Native Dynamics 365 verification
+# Native Dynamics 365 CE v9.1 verification checklist
 
-## Candidate and source
+Use this checklist to verify the native HTML-web-resource build and the shared
+Command Bar Studio editor. Record results for each deployment privately; do not
+commit organization URLs, publisher/solution identities, source XML, business
+record identifiers, import jobs, version receipts or exported source hashes.
+See [onpremises.md](onpremises.md) for packaging, permissions, installation,
+upgrade and recovery instructions. For source/UI parity, see
+[frontend-fidelity.md](frontend-fidelity.md).
 
-Reference upstream commit: `27128373a3e4af32b81c07511191ada15192bc4f`.
-Feature branch: `feat/onpremises-v91-native`.
-Native application solution version: **1.0.1.1**.
+## Automated validation before deployment
 
-The original CBS frontend is reused; the changes and source comparison are
-documented in [frontend-fidelity.md](frontend-fidelity.md). The original canvas,
-Classic/Modern/List renderers, shell layout, global CSS, UI preference store,
-properties, command and rule editors remain the existing implementations.
+Run from the repository root with its declared dependencies installed:
 
-## Local verification
-
-| Check | Result |
-|---|---|
-| TypeScript (`npm run typecheck`) | Passed, exit 0 |
-| ESLint (`npm run lint`) | Passed, zero lint warnings, exit 0 |
-| Vitest (`npm test -- --maxWorkers=1`) | 427 passed in 33 files; no failed/skipped tests |
-| Native packaging Node tests | 13 passed; no failed/skipped tests |
-| Native production build | Passed, exit 0 |
-| Original PPTB production build | Passed, exit 0 |
-| Private read-only real Lead/Application source regressions | Passed, 3/3 |
-| Independent read-only code review | No concrete P0/P1 release-blocking finding |
-
-The full Vitest run had zero React `act` warnings. Four teardown messages came
-from the installed Fluent/Tabster dependency tree carrying both Keyborg 2 and 3.
-They were not suppressed and did not fail tests. Neither dependencies nor the
-user's pre-existing untracked lockfile were changed to hide this behavior.
-
-Vite reports the deliberately external CRM context script and large Monaco
-chunks. The packaged HTML preserves the blocking context script before the module
-entry; all emitted runtime assets are validated. These build warnings are not
-missing assets or a CDN dependency.
-
-## Installer
-
-The native package contains **122 web resources**, with **15,360,422 bytes** of
-uncompressed application assets. The largest resource, the TypeScript worker, is
-**7,010,226 bytes**; deployment packaging used a verified 8 MiB per-file ceiling.
-No organization upload-limit setting was changed.
-
-The installation ZIP is **3,976,717 bytes**. SHA-256:
-
-```text
-042e26aa0a84af7e8a1f3efe7006b4c255b2f89b0c76db19df1383831b456adb
+```powershell
+npm run typecheck
+npm run lint
+npm test -- --maxWorkers=1
+npm run test:package:onprem
+npm run build
+npm run build:onprem
 ```
 
-The local distributable is
-`dist-onprem-package/CommandBarStudioNative_1_0_1_1_unmanaged.zip`, with a matching
-`asset-manifest-1.0.1.1.json`. This particular package preserves the already
-installed tool's publisher/solution identity; the CLI can produce a package for
-another explicitly supplied identity. Do not reuse an unrelated organization's
-publisher without checking its actual identifiers.
+All checks must exit successfully. Vitest covers transport, XML parsing and
+preservation, publication conflicts/recovery, ribbon editing, drafts and shared
+frontend behavior. Native packaging tests also validate the resource archive,
+stable identities and unsafe input rejection. Keep the complete test output;
+separately identify dependency teardown notices, Vite's external CRM context
+script notice and Monaco chunk-size warnings rather than hiding them.
 
-## Acceptance boundaries
+Check the built native assets and package without connecting to CRM:
 
-The user authorized updating the application, followed by **read-only** checks in
-solution `Ribbon`, entity `Lead`. No Lead customization import/publication or
-business-record edits are part of this acceptance. ExportSolution is used only
-to read the existing unmanaged definition and compare it before/after.
-
-The local real-data checks verified the native `<Name>Lead</Name>` casing,
-restored supplied custom labels/translations, parsed the contextual Lead SubGrid
-tab, and confirmed an unchanged entity/application baseline yields no CustomAction
-delta. They locally repackaged/read the same entity definition without changing
-its XML and performed no CRM writes.
-
-## Completed deployment and read-only browser acceptance
-
-The application-only update to **1.0.1.1** was imported successfully: its import
-job reported progress 100, 153 success results and zero failures. Only the tool's
-122 web resources were then published. The server-side content hashes of all 122
-resources matched the packaged manifest, and the published entry returned HTTP
-200. A subsequent fresh check confirmed the installed solution version and the
-same entry hash. No duplicate installation or new redesign was performed when
-the interrupted session resumed.
-
-The original CBS application was opened on **solution Ribbon / entity Lead**.
-Read-only checks covered Classic, Modern and List views; Home Grid, contextual
-Sub Grid, Form and Application locations; selecting an existing custom button;
-its original properties and translations; command/rule inspection; the original
-XML drawer; and side-by-side/unified comparison. The comparison showed **zero
-added and zero removed lines** for the unchanged source. Repeated comparison
-close/reopen and Escape dismissal produced no captured JavaScript errors.
-
-The native source compatibility fixes resolved the existing custom labels,
-including `Set Reminder`, and loaded all five web-resource images observed in the
-selected view. At a 1920-pixel viewport the canvas occupied 1310 pixels alongside
-the docked properties pane; it no longer overflowed to more than 13000 pixels.
-No blanket inert gate remained. Final inspection showed **History (0), no Lead
-draft, no attempted blocked write, and no open modal**. The application was left
-on Lead's Modern command bar with Set Reminder selected and the command filter
-cleared.
-
-### Unchanged customization evidence
-
-Before deployment and after read-only acceptance, the exported Lead source had
-the same SHA-256 values:
-
-```text
-customizations.xml:
-51cc5abd3d9421282c1161f8b79acf50db3de6785e727360c10069ca6cb0e96d
-
-Lead RibbonDiffXml:
-3bd6743ec17e4e2d0c553a63754eb1638fe7277f60d893c125131803e210f22c
+```powershell
+# Substitute the verified per-file limit of the target organization.
+npm run package:onprem -- --max-file-bytes 8388608 --dry-run
+npm run package:onprem -- --max-file-bytes 8388608
 ```
 
-The exported definition still contained 10 commands and 17 localized-label
-definitions. The final source check was at `2026-10-15T08:08:24.576Z`; final
-browser checks completed at `2026-10-15T08:16:27.167Z`. No Lead customization
-import, entity publication, application-ribbon publication or business-record
-write was executed as part of this acceptance.
+- Confirm the dry run lists every resource, its size and the largest file;
+  never assume a compressed ZIP fits the uncompressed per-resource limit.
+- Inspect `asset-manifest.json`: resource names and GUIDs must be unique,
+  stable for unchanged logical names, and consistent with the chosen publisher.
+- Confirm the unmanaged ZIP includes real `WebResources/` binary entries for
+  every manifest reference, together with valid solution/customization metadata.
+- Verify relative module/stylesheet paths, bundled worker assets and a blocking
+  `ClientGlobalContext.js.aspx` before the native module entry. The deployed
+  package must not require localhost, a CDN or an external auth proxy.
+- Verify the original PPTB build still works independently of the native entry.
 
-### Performance observations and remaining upstream behavior
+## Isolated CRM acceptance
 
-View changes and editor inspection reuse the loaded workspace. The restored
-frontend keeps the original lazy-loaded panels, memoized views and virtualized
-lists. Six observed click handlers took approximately **5–321 ms** in the attached
-browser. Background-tab frame scheduling affected paint timings, so those
-measurements are not a foreground performance benchmark. A read-only server
-ExportSolution took **10.45 seconds**; server export time remains a loading cost,
-not something hidden by a fabricated instant result.
+Start in an isolated non-production organization using disposable test
+components and an explicitly selected unmanaged solution. Retain private
+before/after exports if the environment's change-control process requires them.
 
-Built-in platform `$Resources:` keys that CRM does not supply as label definitions
-continue to use CBS's original fallback. They were not replaced with guessed
-English text or a redesigned renderer. The supplied custom labels and actual CRM
-resource images do resolve. The UI is the original CBS implementation, not a
-new visual design or a claim that every upstream feature is bug-free.
+1. Verify the publisher unique name, prefix, option-value prefix, solution
+   identity and version against the target; never borrow an unrelated identity.
+2. Import the editor-only unmanaged package, inspect the actual import-job result
+   and publish the imported web resources with a supported targeted operation.
+   Record the result separately from package creation.
+3. Inspect the installed HTML entry, module/chunk/CSS/worker requests and
+   network responses. Confirm the signed-in CRM session and organization virtual
+   path are used consistently, with no cross-origin or redirected login response.
+4. Read a known entity's ribbon through the normal UI. Check Classic, Modern,
+   List, Home Grid, SubGrid, Form and Application views and original properties,
+   command/rule editors, import dialog, XML drawer and diff drawer. Missing source
+   permissions must be explicit without blocking read-only inspection.
+5. Check that a merged response without `LocLabels` gets custom text/translations
+   from the exported unmanaged source; `$Resources:` keys without supplied labels
+   keep the existing CBS fallback. Verify tabs nested in `ContextualGroup` and
+   same-organization `$webresource:` images, including subdirectory names.
+6. On an untouched workspace, compare exported ribbon XML and generated preview:
+   the source must remain byte-for-byte unchanged, with no added/removed ribbon
+   delta and no generated changes to unsupported XML. Confirm clean history and
+   no unexpected server write requests after inspection.
+7. If write acceptance is authorized, use disposable components to test
+   command-only, rule-only, locale, reorder and explicit delete/unhide cases.
+   Re-export the unmanaged ribbon and read back the compiled ribbon after a
+   targeted publish. Confirm unrelated source nodes and publisher details are
+   preserved and that the recovery package is downloadable.
+8. Test a stale source/version conflict and an unavailable publish operation:
+   both must fail before import without losing the pending draft. A failed or
+   uncertain import/publish must leave the workspace dirty, and no targeted
+   failure may fall back to a broad `PublishAllXmlAsync` operation.
+9. Remove only owned disposable acceptance components, verify cleanup and
+   preserve the editor deployment if it is meant to remain installed.
 
-Closing verification was rerun on the unchanged application commit `d61271d`:
-427/427 Vitest tests, 13/13 packaging tests, TypeScript and ESLint passed. The
-unsilenced run had zero React act warnings and the four known Keyborg teardown
-messages described above. Private source XML, deployment receipts, hashes and
-browser observations are retained locally under `.cbs-probe/reconciliation/`,
-which is ignored by Git; they are not included in the distributable or PR.
+Record separately whether the tested environment allows live *ribbon writes*;
+a successful editor installation or read-only inspection does not establish
+write-side behavior in arbitrary solutions or other Dynamics versions.
 
-The two implementation commits are `3578254` (native support with the original
-frontend) and `d61271d` (contextual ribbon parsing, unchanged comparison and Monaco
-lifecycle fixes). No remote push or upstream PR submission was performed. This
-read-only acceptance is not certification of arbitrary business-ribbon writes.
+## Evidence to capture per verification run
 
-Test-only browser API wrappers and timing observers were removed after acceptance
-so the installed tool retains its normal host behavior. The owned temporary
-deployment/evidence server was stopped. The original application tab remains open;
-the installed application's resources were intentionally retained, not removed as
-disposable test components. The pre-existing untracked lockfile was left unchanged.
+Use a private change-control record with the tested Git revision, CRM release,
+environment class (development/test/production), command and test outcomes,
+package resource count and size limit, import/publish status, browser/network
+observations, source-comparison result and any remaining limitations. Never
+copy production XML, job identifiers, resource hashes or screenshots containing
+customer data into the upstream pull request.

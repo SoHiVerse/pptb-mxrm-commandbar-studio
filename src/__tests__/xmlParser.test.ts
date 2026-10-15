@@ -110,6 +110,29 @@ describe("parseRibbonXml — provenance heuristic", () => {
 	});
 });
 
+describe("parseRibbonXml — numeric boolean action arguments", () => {
+	it("treats BoolParameter Value=1 as true without losing argument order", () => {
+		const xml = `<RibbonDefinitions><CommandDefinitions><CommandDefinition Id="Custom.C"><EnableRules/><DisplayRules/><Actions><JavaScriptFunction Library="$webresource:custom_/x.js" FunctionName="Run"><BoolParameter Value="1"/><BoolParameter Value="0"/><StringParameter Value="last"/></JavaScriptFunction></Actions></CommandDefinition></CommandDefinitions></RibbonDefinitions>`;
+		const command = parseRibbonXml(xml, "Form", "account").commands[0];
+		expect(command.actions[0].kind).toBe("javascript");
+		if (command.actions[0].kind !== "javascript") throw new Error("Expected JavaScript action");
+		expect(command.actions[0].params).toEqual([
+			{ kind: "BoolParameter", name: undefined, value: true },
+			{ kind: "BoolParameter", name: undefined, value: false },
+			{ kind: "StringParameter", name: undefined, value: "last" },
+		]);
+	});
+});
+
+describe("parseRibbonXml — structural declaration scoping", () => {
+	it("does not create duplicate displayed tabs from CustomAction-nested Tab declarations", () => {
+		const xml = `<RibbonDefinitions><Ribbon><Tabs><Tab Id="T" Title="First"><Groups><Group Id="G" Label="Main"><Controls/></Group></Groups></Tab></Tabs></Ribbon><CustomActions><CustomAction Id="override" Location="Mscrm.Tabs._children"><CommandUIDefinition><Ribbon><Tabs><Tab Id="T" Title="Nested duplicate"><Groups><Group Id="Other" Label="Other"><Controls/></Group></Groups></Tab></Tabs></Ribbon></CommandUIDefinition></CustomAction></CustomActions></RibbonDefinitions>`;
+		const result = parseRibbonXml(xml, "Form", "account");
+		expect(result.ribbon.tabs.map(tab => tab.id)).toEqual(["T"]);
+		expect(result.ribbon.tabs[0].groups.map(group => group.id)).toEqual(["G"]);
+	});
+});
+
 // ── Error handling ─────────────────────────────────────────────────────────
 
 describe("parseRibbonXml — error handling", () => {

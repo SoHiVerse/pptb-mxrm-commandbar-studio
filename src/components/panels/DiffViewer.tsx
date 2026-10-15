@@ -19,6 +19,8 @@ import { useUIStore } from "@/store/uiStore";
 import { useRibbonStore } from "@/store/ribbonStore";
 import { generateRibbonDiffXml } from "@/services/xmlGenerator";
 import type { RibbonLocation } from "@/types/ribbon";
+import { buildRibbonPreview, type RibbonPreviewScope } from "@/services/ribbonPreview";
+import type { RibbonSourceSnapshot, RibbonWorkspace } from "@/types/workspace";
 
 // Lazy-load DiffEditor so Monaco stays out of the initial bundle
 const DiffEditorLazy = React.lazy(() =>
@@ -77,38 +79,42 @@ function diffStats(before: string, after: string) {
 	return { added, removed };
 }
 
-function tryGenerateXml(
-	ribbons: ReturnType<typeof useRibbonStore.getState>["ribbons"],
-	baseline: ReturnType<typeof useRibbonStore.getState>["baseline"],
-	commands: ReturnType<typeof useRibbonStore.getState>["commands"],
-	displayRules: ReturnType<typeof useRibbonStore.getState>["displayRules"],
-	enableRules: ReturnType<typeof useRibbonStore.getState>["enableRules"],
-	locLabels: ReturnType<typeof useRibbonStore.getState>["locLabels"],
-	useBaseline: boolean,
-): string {
-	const xmlParts: string[] = [];
-	for (const loc of LOCATIONS) {
-		const source = useBaseline ? baseline[loc] : ribbons[loc];
-		const base = baseline[loc];
+function buildDiffDocuments(current: RibbonWorkspace, baseline: RibbonWorkspace, sourceSnapshot: RibbonSourceSnapshot | null) {
+	const originals: string[] = [];
+	const modified: string[] = [];
+	const errors: string[] = [];
+	for (const scope of ["entity", "application"] as const satisfies readonly RibbonPreviewScope[]) {
+		const title = scope === "entity" ? "Entity (Home Grid + Sub Grid + Form)" : "Application";
 		try {
-			xmlParts.push(
-				`<!-- ${loc} -->\n` +
-					generateRibbonDiffXml({
-						location: loc,
-						current: source,
-						baseline: base,
-						commands,
-						displayRules,
-						enableRules,
-						locLabels,
-						entityLogicalName: source.entityLogicalName,
-					}),
-			);
-		} catch (e) {
-			xmlParts.push(`<!-- ${loc}: Error generating XML: ${String(e)} -->`);
+			const preview = buildRibbonPreview({ current, baseline, sourceSnapshot }, scope);
+			originals.push(`<!-- ${title}: original exported unmanaged source -->\n${preview.originalXml}`);
+			modified.push(`<!-- ${title}: complete preserved target -->\n${preview.mergedXml}`);
+		} catch (cause) {
+			const reason = cause instanceof Error ? cause.message : String(cause);
+			errors.push(`${title}: ${reason}`);
+			// The upstream comparison editor must still open when source retrieval
+			// fails. The fallback is delta ONLY, not an imagined complete baseline.
+			originals.push(`<!-- ${title}: complete exported source unavailable. Delta inspection only; cannot publish. -->\n<RibbonDiffXml/>`);
+			const scopedLocations: readonly RibbonLocation[] = scope === "entity" ? LOCATIONS.slice(0, 3) : ["Application"];
+			const fragments: string[] = [];
+			for (const location of scopedLocations) {
+				try {
+					fragments.push(`<!-- ${location}: unsourced delta -->\n${generateRibbonDiffXml({
+						location,
+						current: current.ribbons[location], baseline: baseline.ribbons[location],
+						commands: current.commands, enableRules: current.enableRules,
+						displayRules: current.displayRules, locLabels: current.locLabels,
+						baselineDefinitions: baseline,
+						entityLogicalName: current.ribbons[location].entityLogicalName,
+					})}`);
+				} catch {
+					fragments.push(`<!-- ${location}: delta generation unavailable; no server write is possible. -->\n<RibbonDiffXml/>`);
+				}
+			}
+			modified.push(`<!-- ${title}: incomplete delta-only fallback; cannot publish without matching source. -->\n${fragments.join("\n\n")}`);
 		}
 	}
-	return xmlParts.join("\n\n");
+	return { original: originals.join("\n\n"), modified: modified.join("\n\n"), errors };
 }
 
 export const DiffViewer: React.FC = () => {
@@ -121,6 +127,8 @@ export const DiffViewer: React.FC = () => {
 
 	const ribbons = useRibbonStore((s) => s.ribbons);
 	const baseline = useRibbonStore((s) => s.baseline);
+	const baselineDefinitions = useRibbonStore((s) => s.baselineDefinitions);
+	const sourceSnapshot = useRibbonStore((s) => s.sourceSnapshot);
 	const commands = useRibbonStore((s) => s.commands);
 	const displayRules = useRibbonStore((s) => s.displayRules);
 	const enableRules = useRibbonStore((s) => s.enableRules);
@@ -128,17 +136,16 @@ export const DiffViewer: React.FC = () => {
 
 	const isDark = themeMode === "dark";
 
-	const baselineXml = useMemo(
-		() => tryGenerateXml(ribbons, baseline, commands, displayRules, enableRules, locLabels, true),
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-		[open],
+	const preview = useMemo(
+		() => buildDiffDocuments(
+			{ ribbons, commands, displayRules, enableRules, locLabels },
+			{ ribbons: baseline, ...baselineDefinitions },
+			sourceSnapshot,
+		),
+		[ribbons, baseline, baselineDefinitions, commands, displayRules, enableRules, locLabels, sourceSnapshot],
 	);
-
-	const currentXml = useMemo(
-		() => tryGenerateXml(ribbons, baseline, commands, displayRules, enableRules, locLabels, false),
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-		[open, ribbons, baseline, commands, displayRules, enableRules, locLabels],
-	);
+	const baselineXml = preview.original;
+	const currentXml = preview.modified;
 
 	const { added, removed } = diffStats(baselineXml, currentXml);
 
@@ -193,12 +200,14 @@ export const DiffViewer: React.FC = () => {
 				}}
 			>
 				<div className={styles.body}>
-					<MessageBar intent="info">
-						<MessageBarBody>
-							<Text size={200}>
-								{mode === "compare"
-									? "Showing current state vs. last published baseline."
-									: "Showing the change introduced by this history entry."}
+						<MessageBar intent={preview.errors.length ? "warning" : "info"}>
+							<MessageBarBody>
+								<Text size={200}>
+									{preview.errors.length ? (
+										`Complete exported source unavailable for: ${preview.errors.join("; ")}. Displaying inspection-only delta fallback where needed; this comparison cannot publish without a matching exported solution source.`
+									) : mode === "compare"
+										? "Showing complete exported entity and application unmanaged source vs. the preserved merged target, including Home Grid, Sub Grid and Form changes."
+										: "Showing the complete exported source against the current merged target for this history view."}
 							</Text>
 						</MessageBarBody>
 					</MessageBar>

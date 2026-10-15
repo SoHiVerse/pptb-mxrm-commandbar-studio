@@ -29,7 +29,7 @@ import {
 	fetchSolutionRibbonComponentIds,
 } from "@/services/dataverse/solutionService";
 import { fetchEntitiesByMetadataIds } from "@/services/dataverse/entityService";
-import { fetchRibbonWorkspace } from "@/services/dataverse/ribbonService";
+import { fetchSourceBoundWorkspace } from "@/services/dataverse/workspaceLoadService";
 import { fetchRibbonProvenance } from "@/services/dataverse/ribbonProvenanceService";
 import { applyProvenanceToRibbons, type ButtonProvenance } from "@/utils/ribbonProvenance";
 import type { ConflictEntry } from "@/types/ribbon";
@@ -90,7 +90,10 @@ export function App() {
 	const activeSolution = useSessionStore((s) => s.activeSolution);
 	const activeEntity = useSessionStore((s) => s.activeEntity);
 	const loadWorkspace = useRibbonStore((s) => s.loadWorkspace);
-	const loadRibbons = useRibbonStore((s) => s.loadRibbons);
+	const clearWorkspace = useRibbonStore((s) => s.clearWorkspace);
+	const restoreDraft = useRibbonStore((s) => s.restoreDraft);
+	const sourceSnapshot = useRibbonStore((s) => s.sourceSnapshot);
+	const mutationsSincePublish = useRibbonStore((s) => s.mutationsSincePublish);
 	const setTabId = useSelectionStore((s) => s.setTabId);
 	const themeMode = useUIStore((s) => s.themeMode);
 	const logInfo = useRuntimeLogStore((s) => s.logInfo);
@@ -99,6 +102,12 @@ export function App() {
 
 	// Auto-save ribbon state on every mutation
 	useRibbonPersistence();
+	useEffect(() => {
+		if (mutationsSincePublish === 0) return;
+		const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+		window.addEventListener("beforeunload", warn);
+		return () => window.removeEventListener("beforeunload", warn);
+	}, [mutationsSincePublish]);
 
 	// Restore banner state
 	const [showRestoreBanner, setShowRestoreBanner] = useState(false);
@@ -106,6 +115,7 @@ export function App() {
 		useState<ReturnType<typeof loadPersistedRibbonData>>(null);
 	const [ribbonLoadState, setRibbonLoadState] = useState<"idle" | "loading" | "error">("idle");
 	const [ribbonLoadError, setRibbonLoadError] = useState<string | null>(null);
+	const [restoreError, setRestoreError] = useState<string | null>(null);
 	const [reloadVersion, setReloadVersion] = useState(0);
 
 	// ----- Initial bootstrap: solutions + current user only -----
@@ -166,7 +176,10 @@ export function App() {
 				// application-ribbon publish path.
 				const [entityIds, ribbonIds] = await Promise.all([
 					fetchSolutionEntityIds(activeSolution.id),
-					fetchSolutionRibbonComponentIds(activeSolution.id),
+					fetchSolutionRibbonComponentIds(activeSolution.id).catch((error) => {
+						logWarn("runtime", `Application ribbon component lookup unavailable: ${String(error)}`);
+						return [] as string[];
+					}),
 				]);
 				if (cancelled) return;
 				setSolutionEntityIds(entityIds);
@@ -184,8 +197,7 @@ export function App() {
 				if (cancelled) return;
 				logError(
 					"runtime",
-					`Failed to load solution tables: ${
-						error instanceof Error ? error.message : String(error)
+					`Failed to load solution tables: ${error instanceof Error ? error.message : String(error)
 					}`,
 				);
 				setSolutionEntityIds([]);
@@ -197,12 +209,20 @@ export function App() {
 		return () => {
 			cancelled = true;
 		};
-	}, [activeSolution, setEntities, setSolutionEntityIds, setSolutionRibbonComponentIds, logError]);
+	}, [activeSolution, setEntities, setSolutionEntityIds, setSolutionRibbonComponentIds, logError, logWarn]);
 
 	// ----- When the user picks an entity (inside an active solution),
 	// load the ribbon workspace.
 	useEffect(() => {
-		if (!activeEntity?.logicalName) return;
+		clearWorkspace();
+		setShowRestoreBanner(false);
+		setPendingRestore(null);
+		setRestoreError(null);
+		if (!activeEntity?.logicalName || !activeSolution || !connectionUrl) {
+			setRibbonLoadState("idle");
+			setRibbonLoadError(null);
+			return;
+		}
 
 		let cancelled = false;
 		setRibbonLoadState("loading");
@@ -214,13 +234,15 @@ export function App() {
 		// seeding the store. Provenance is best-effort — if the layer API is
 		// unavailable we keep the parser's heuristic (so this never blocks load).
 		void Promise.all([
-			fetchRibbonWorkspace(activeEntity.logicalName),
+			fetchSourceBoundWorkspace(activeSolution.uniqueName, activeEntity.logicalName, connectionUrl),
 			fetchRibbonProvenance(activeEntity.logicalName).catch(
 				() => new Map<string, ButtonProvenance>(),
 			),
 		])
-			.then(([workspace, provenance]) => {
+			.then(([loaded, provenance]) => {
 				if (cancelled) return;
+				const { workspace, sourceSnapshot: source, sourceError } = loaded;
+				if (sourceError) logWarn("publish", `Publication unavailable until source can be loaded: ${sourceError}. The editor remains available.`);
 				applyProvenanceToRibbons(workspace.ribbons, provenance);
 
 				// Build ConflictEntry records for buttons whose provenance resolved
@@ -264,6 +286,8 @@ export function App() {
 					displayRules: workspace.displayRules,
 					enableRules: workspace.enableRules,
 					locLabels: workspace.locLabels,
+					sourceSnapshot: source,
+					conflicts: conflictEntries,
 				});
 
 				// Snapshot the current selection at success-time via getState()
@@ -293,13 +317,15 @@ export function App() {
 		return () => {
 			cancelled = true;
 		};
-	}, [activeEntity?.logicalName, loadWorkspace, reloadVersion, setTabId, logInfo, logError]);
+	}, [activeEntity?.logicalName, activeSolution, connectionUrl, loadWorkspace, clearWorkspace, reloadVersion, setTabId, logInfo, logWarn, logError]);
 
 	// Check for persisted state when entity or connection changes
 	useEffect(() => {
-		if (!connectionUrl) return;
-		const entityLogicalName = activeEntity?.logicalName ?? "";
-		const saved = loadPersistedRibbonData(connectionUrl, entityLogicalName);
+		if (!sourceSnapshot?.organizationUrl || mutationsSincePublish > 0) {
+			setShowRestoreBanner(false);
+			return;
+		}
+		const saved = loadPersistedRibbonData(sourceSnapshot.organizationUrl, sourceSnapshot.entityLogicalName, sourceSnapshot.solutionUniqueName, sourceSnapshot.userId);
 		if (saved) {
 			setPendingRestore(saved);
 			setShowRestoreBanner(true);
@@ -307,25 +333,38 @@ export function App() {
 			setShowRestoreBanner(false);
 			setPendingRestore(null);
 		}
-	}, [connectionUrl, activeEntity?.logicalName]);
+	}, [sourceSnapshot, mutationsSincePublish]);
 
 	function handleRestore() {
 		if (!pendingRestore) return;
-		loadRibbons(pendingRestore.ribbons);
-		setShowRestoreBanner(false);
-		setPendingRestore(null);
+		try {
+			restoreDraft(pendingRestore);
+			setShowRestoreBanner(false);
+			setPendingRestore(null);
+			setRestoreError(null);
+		} catch (error) {
+			setRestoreError(error instanceof Error ? error.message : String(error));
+		}
 	}
 
 	function handleDiscard() {
-		if (connectionUrl) {
-			clearPersistedRibbonData(connectionUrl, activeEntity?.logicalName ?? "");
+		if (sourceSnapshot?.organizationUrl) {
+			clearPersistedRibbonData(sourceSnapshot.organizationUrl, sourceSnapshot.entityLogicalName, sourceSnapshot.solutionUniqueName, sourceSnapshot.userId);
 		}
 		setShowRestoreBanner(false);
 		setPendingRestore(null);
+		setRestoreError(null);
 	}
 
 	function handleRetryRibbonLoad() {
 		setReloadVersion((v) => v + 1);
+	}
+
+	function downloadSavedDraft() {
+		if (!pendingRestore) return;
+		const url = URL.createObjectURL(new Blob([JSON.stringify(pendingRestore, null, 2)], { type: "application/json" }));
+		const link = document.createElement("a"); link.href = url; link.download = `${pendingRestore.sourceSnapshot.entityLogicalName}-ribbon-draft.json`;
+		link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 	}
 
 	return (
@@ -337,8 +376,9 @@ export function App() {
 						style={{ position: "absolute", top: 0, left: 0, right: 0, zIndex: 1000 }}
 					>
 						<MessageBarBody>
-							You have unsaved changes from a previous session (saved{" "}
-							{new Date(pendingRestore.savedAt).toLocaleString()}).
+							{restoreError || <>You have unsaved changes from a previous session (saved{" "}
+								{new Date(pendingRestore.savedAt).toLocaleString()}).
+							</>}
 						</MessageBarBody>
 						<MessageBarActions
 							containerAction={
@@ -350,6 +390,7 @@ export function App() {
 							<Button size="small" appearance="primary" onClick={handleRestore}>
 								Restore
 							</Button>
+							<Button size="small" onClick={downloadSavedDraft}>Download draft</Button>
 						</MessageBarActions>
 					</MessageBar>
 				)}

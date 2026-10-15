@@ -32,6 +32,8 @@ export type RibbonOrigin = "oob" | "managed" | "unmanaged";
 
 export interface RibbonButton {
 	id: string;
+	/** Raw merged control XML. Preserves extension attributes and nested menus on an edit. */
+	sourceXml?: string;
 	label: string;
 	tooltipTitle?: string;
 	tooltipBody?: string;
@@ -56,6 +58,8 @@ export interface RibbonButton {
 
 export interface RibbonGroup {
 	id: string;
+	/** Original group subtree, including elements the visual model cannot represent. */
+	sourceXml?: string;
 	label: string;
 	sequence: number;
 	template: string;
@@ -64,6 +68,8 @@ export interface RibbonGroup {
 
 export interface RibbonTab {
 	id: string;
+	/** Original tab subtree. Do not regenerate unknown children from the visual model. */
+	sourceXml?: string;
 	label: string;
 	sequence: number;
 	commandId?: string;
@@ -82,6 +88,8 @@ export interface RibbonDefinition {
 
 export interface CommandDefinition {
 	id: string;
+	/** Original command XML, including unsupported action/extensions for safe comparisons. */
+	sourceXml?: string;
 	enableRules: string[];
 	displayRules: string[];
 	actions: RibbonAction[];
@@ -153,11 +161,13 @@ export type CrmParameterValue =
 
 export interface EnableRule {
 	id: string;
+	sourceXml?: string;
 	steps: RuleStep[];
 }
 
 export interface DisplayRule {
 	id: string;
+	sourceXml?: string;
 	steps: RuleStep[];
 }
 
@@ -165,175 +175,175 @@ export interface DisplayRule {
 // Rules marked "(display only)" are NOT valid inside an <EnableRule>.
 export type RuleStep =
 	| {
-			kind: "CommandClientTypeRule";
-			// "Modern"  = Dynamics 365 for tablets (NOT Unified Interface web client)
-			// "Refresh" = Updated UI / Unified Interface (web)
-			// "Legacy"  = Classic ribbon / Outlook list views
-			type: "Modern" | "Refresh" | "Legacy";
-			default?: boolean;
-			invertResult?: boolean;
-	  }
+		kind: "CommandClientTypeRule";
+		// "Modern"  = Dynamics 365 for tablets (NOT Unified Interface web client)
+		// "Refresh" = Updated UI / Unified Interface (web)
+		// "Legacy"  = Classic ribbon / Outlook list views
+		type: "Modern" | "Refresh" | "Legacy";
+		default?: boolean;
+		invertResult?: boolean;
+	}
 	| { kind: "CrmClientTypeRule"; type: "Web" | "Outlook"; invertResult?: boolean }
 	| { kind: "CrmOfflineAccessStateRule"; state: "Offline" | "Online"; invertResult?: boolean }
 	| {
-			kind: "CrmOutlookClientTypeRule";
-			type: "CrmForOutlook" | "CrmForOutlookOfflineAccess";
-			invertResult?: boolean;
-	  }
+		kind: "CrmOutlookClientTypeRule";
+		type: "CrmForOutlook" | "CrmForOutlookOfflineAccess";
+		invertResult?: boolean;
+	}
 	| {
-			// display only
-			kind: "CrmOutlookClientVersionRule";
-			major: number;
-			minor?: number;
-			build?: number;
-			revision?: number;
-			invertResult?: boolean;
-	  }
+		// display only
+		kind: "CrmOutlookClientVersionRule";
+		major: number;
+		minor?: number;
+		build?: number;
+		revision?: number;
+		invertResult?: boolean;
+	}
 	| {
-			kind: "CustomRule";
-			library: string;
-			functionName: string;
-			default?: boolean;
-			invertResult?: boolean;
-	  }
+		kind: "CustomRule";
+		library: string;
+		functionName: string;
+		default?: boolean;
+		invertResult?: boolean;
+	}
 	| {
-			// display only
-			kind: "DeviceTypeRule";
-			type: "None" | "Phone" | "Tablet" | "Web" | "Outlook" | "InteractionCentric";
-			invertResult?: boolean;
-	  }
+		// display only
+		kind: "DeviceTypeRule";
+		type: "None" | "Phone" | "Tablet" | "Web" | "Outlook" | "InteractionCentric";
+		invertResult?: boolean;
+	}
 	| {
-			// display only — privilegeDepth REQUIRED
-			kind: "EntityPrivilegeRule";
-			entityName?: string;
-			appliesTo?: "PrimaryEntity" | "SelectedEntity";
-			privilegeType:
-				| "Create"
-				| "Read"
-				| "Write"
-				| "Delete"
-				| "Assign"
-				| "Share"
-				| "Append"
-				| "AppendTo";
-			privilegeDepth: "None" | "Basic" | "Local" | "Deep" | "Global";
-			invertResult?: boolean;
-	  }
+		// display only — privilegeDepth REQUIRED
+		kind: "EntityPrivilegeRule";
+		entityName?: string;
+		appliesTo?: "PrimaryEntity" | "SelectedEntity";
+		privilegeType:
+		| "Create"
+		| "Read"
+		| "Write"
+		| "Delete"
+		| "Assign"
+		| "Share"
+		| "Append"
+		| "AppendTo";
+		privilegeDepth: "None" | "Basic" | "Local" | "Deep" | "Global";
+		invertResult?: boolean;
+	}
 	| {
-			// display only — propertyValue REQUIRED
-			kind: "EntityPropertyRule";
-			entityName?: string;
-			appliesTo?: "PrimaryEntity" | "SelectedEntity";
-			propertyName: EntityProperty;
-			propertyValue: boolean;
-			invertResult?: boolean;
-	  }
+		// display only — propertyValue REQUIRED
+		kind: "EntityPropertyRule";
+		entityName?: string;
+		appliesTo?: "PrimaryEntity" | "SelectedEntity";
+		propertyName: EntityProperty;
+		propertyValue: boolean;
+		invertResult?: boolean;
+	}
 	| {
-			kind: "EntityRule";
-			entityName?: string;
-			context?: string;
-			appliesTo?: "PrimaryEntity" | "SelectedEntity";
-			invertResult?: boolean;
-	  }
+		kind: "EntityRule";
+		entityName?: string;
+		context?: string;
+		appliesTo?: "PrimaryEntity" | "SelectedEntity";
+		invertResult?: boolean;
+	}
 	| { kind: "FormEntityContextRule"; entityName: string; invertResult?: boolean }
 	| {
-			kind: "FormStateRule";
-			state: "Create" | "Existing" | "ReadOnly" | "Disabled" | "BulkEdit";
-			invertResult?: boolean;
-	  }
+		kind: "FormStateRule";
+		state: "Create" | "Existing" | "ReadOnly" | "Disabled" | "BulkEdit";
+		invertResult?: boolean;
+	}
 	| {
-			kind: "FormTypeRule";
-			type:
-				| "Main"
-				| "Preview"
-				| "AppointmentBook"
-				| "Dashboard"
-				| "Quick"
-				| "QuickCreate"
-				| "Card"
-				| "MainInteractionCentric";
-			invertResult?: boolean;
-	  }
+		kind: "FormTypeRule";
+		type:
+		| "Main"
+		| "Preview"
+		| "AppointmentBook"
+		| "Dashboard"
+		| "Quick"
+		| "QuickCreate"
+		| "Card"
+		| "MainInteractionCentric";
+		invertResult?: boolean;
+	}
 	| { kind: "HideForTabletExperienceRule"; invertResult?: boolean }
 	| {
-			kind: "MiscellaneousPrivilegeRule";
-			privilegeName: string;
-			privilegeDepth?: "None" | "Basic" | "Local" | "Deep" | "Global";
-			invertResult?: boolean;
-	  }
+		kind: "MiscellaneousPrivilegeRule";
+		privilegeName: string;
+		privilegeDepth?: "None" | "Basic" | "Local" | "Deep" | "Global";
+		invertResult?: boolean;
+	}
 	| {
-			// display only
-			kind: "OptionSetRule";
-			optionSet: string;
-			stateCode: string;
-			objectTypeCode: string;
-			invertResult?: boolean;
-	  }
+		// display only
+		kind: "OptionSetRule";
+		optionSet: string;
+		stateCode: string;
+		objectTypeCode: string;
+		invertResult?: boolean;
+	}
 	| {
-			kind: "OrganizationSettingRule";
-			setting:
-				| "IsSharepointEnabled"
-				| "IsSOPIntegrationEnabled"
-				| "IsFiscalCalendarDefined"
-				| "IsReadFormModeDefined"
-				| "IsBPFEntityCustomizationFeatureEnabled";
-			invertResult?: boolean;
-	  }
+		kind: "OrganizationSettingRule";
+		setting:
+		| "IsSharepointEnabled"
+		| "IsSOPIntegrationEnabled"
+		| "IsFiscalCalendarDefined"
+		| "IsReadFormModeDefined"
+		| "IsBPFEntityCustomizationFeatureEnabled";
+		invertResult?: boolean;
+	}
 	| {
-			// Schema requires minimum 2 <Or> children
-			kind: "OrRule";
-			rules: RuleStep[];
-	  }
+		// Schema requires minimum 2 <Or> children
+		kind: "OrRule";
+		rules: RuleStep[];
+	}
 	| {
-			kind: "OutlookItemTrackingRule";
-			trackedInCrm: boolean;
-			appliesTo?: "PrimaryEntity";
-			invertResult?: boolean;
-	  }
+		kind: "OutlookItemTrackingRule";
+		trackedInCrm: boolean;
+		appliesTo?: "PrimaryEntity";
+		invertResult?: boolean;
+	}
 	| { kind: "OutlookRenderTypeRule"; type: "Web" | "Outlook"; invertResult?: boolean }
 	| { kind: "OutlookVersionRule"; version: "2003" | "2007" | "2010"; invertResult?: boolean }
 	| { kind: "PageRule"; address: string; invertResult?: boolean }
 	| {
-			kind: "RecordPrivilegeRule";
-			privilegeType:
-				| "Create"
-				| "Read"
-				| "Write"
-				| "Delete"
-				| "Assign"
-				| "Share"
-				| "Append"
-				| "AppendTo";
-			appliesTo?: "PrimaryEntity";
-			invertResult?: boolean;
-	  }
+		kind: "RecordPrivilegeRule";
+		privilegeType:
+		| "Create"
+		| "Read"
+		| "Write"
+		| "Delete"
+		| "Assign"
+		| "Share"
+		| "Append"
+		| "AppendTo";
+		appliesTo?: "PrimaryEntity";
+		invertResult?: boolean;
+	}
 	| { kind: "ReferencingAttributeRequiredRule"; invertResult?: boolean }
 	| {
-			// appliesTo REQUIRED = "SelectedEntity"
-			kind: "RelationshipTypeRule";
-			appliesTo: "SelectedEntity";
-			relationshipType?: "OneToMany" | "ManyToMany" | "NoRelationship";
-			allowCustomRelationship?: boolean;
-			allowSystemRelationship?: boolean;
-			invertResult?: boolean;
-	  }
+		// appliesTo REQUIRED = "SelectedEntity"
+		kind: "RelationshipTypeRule";
+		appliesTo: "SelectedEntity";
+		relationshipType?: "OneToMany" | "ManyToMany" | "NoRelationship";
+		allowCustomRelationship?: boolean;
+		allowSystemRelationship?: boolean;
+		invertResult?: boolean;
+	}
 	| {
-			kind: "SelectionCountRule";
-			minimum?: number;
-			maximum?: number;
-			appliesTo?: "PrimaryEntity" | "SelectedEntity";
-			invertResult?: boolean;
-	  }
+		kind: "SelectionCountRule";
+		minimum?: number;
+		maximum?: number;
+		appliesTo?: "PrimaryEntity" | "SelectedEntity";
+		invertResult?: boolean;
+	}
 	| { kind: "ShowOnQuickActionRule" }
 	| { kind: "ShowOnGridAndQuickActionRule" }
 	| { kind: "ShowOnGridRule" }
 	| { kind: "SkuRule"; sku: "OnPremise" | "Online" | "Spla"; invertResult?: boolean }
 	| {
-			kind: "ValueRule";
-			field: string;
-			value: string;
-			invertResult?: boolean;
-	  };
+		kind: "ValueRule";
+		field: string;
+		value: string;
+		invertResult?: boolean;
+	};
 
 export type EntityProperty =
 	| "DuplicateDetectionEnabled"
@@ -357,25 +367,28 @@ export type EntityProperty =
 
 export interface TabDisplayRule {
 	tabCommand: string;
+	sourceXml?: string;
 	rules: TabDisplayRuleStep[];
 }
 
 export type TabDisplayRuleStep =
 	| {
-			kind: "EntityRule";
-			entityName?: string;
-			appliesTo?: "PrimaryEntity" | "SelectedEntity";
-			context?: "Form" | "HomePageGrid" | "SubGridStandard" | "SubGridAssociated";
-	  }
+		kind: "EntityRule";
+		entityName?: string;
+		appliesTo?: "PrimaryEntity" | "SelectedEntity";
+		context?: "Form" | "HomePageGrid" | "SubGridStandard" | "SubGridAssociated";
+	}
 	| { kind: "PageRule"; address: string };
 
 export interface LocLabel {
 	id: string;
+	sourceXml?: string;
 	titles: { languageCode: number; description: string }[];
 }
 
 export interface ScalingDefinition {
 	tabId: string;
+	sourceXml?: string;
 	maxSizes: ScaleStep[];
 	scales: ScaleStep[];
 }

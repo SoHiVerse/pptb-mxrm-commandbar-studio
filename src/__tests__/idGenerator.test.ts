@@ -36,7 +36,7 @@ describe("generateRibbonId", () => {
 
 	it("sanitizes entity names with special characters", () => {
 		const id = generateRibbonId("my entity!", "Test", "Button", new Set());
-		expect(id).not.toMatch(/[!@#$%^*()=+\[\]{}|;,<>?/\\]/);
+		expect(id).not.toMatch(/[!@#$%^*()=+[\]{}|;,<>?/\\]/);
 	});
 });
 

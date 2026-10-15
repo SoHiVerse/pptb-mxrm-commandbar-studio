@@ -63,6 +63,11 @@ function makeTestRibbon(): RibbonDefinition {
 beforeEach(() => {
 	// Reset store state before each test
 	useRibbonStore.setState({
+		// This fixture represents a loaded editable workspace, not a failed live source export.
+		workspaceReadOnly: false,
+		sourceSnapshot: null,
+		workspaceGeneration: 1,
+		baselineDefinitions: { commands: [], displayRules: [], enableRules: [], locLabels: [] },
 		ribbons: {
 			HomepageGrid: makeTestRibbon(),
 			SubGrid: { location: "SubGrid", entityLogicalName: "account", tabs: [] },

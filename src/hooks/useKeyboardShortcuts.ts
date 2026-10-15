@@ -34,6 +34,7 @@ export function useKeyboardShortcuts() {
 			target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable;
 
 		const handler = (e: KeyboardEvent) => {
+			if (useRibbonStore.getState().workspaceReadOnly) return;
 			const isMac = navigator.platform.toUpperCase().includes("MAC");
 			const ctrl = isMac ? e.metaKey : e.ctrlKey;
 			const target = e.target as HTMLElement;

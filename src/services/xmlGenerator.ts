@@ -18,8 +18,9 @@ import {
 	buttonTooltipBodyId,
 	locLabelRef,
 } from "@/utils/locLabelRef";
+import type { RibbonDefinitions, RibbonDelta } from "@/types/workspace";
 
-interface GeneratorInput {
+export interface GeneratorInput {
 	current: RibbonDefinition;
 	baseline: RibbonDefinition;
 	commands: CommandDefinition[];
@@ -28,6 +29,181 @@ interface GeneratorInput {
 	locLabels: LocLabel[];
 	entityLogicalName: string;
 	location: RibbonLocation;
+	/** Immutable definitions captured with the loaded ribbon; required for definition-only changes. */
+	baselineDefinitions?: RibbonDefinitions;
+	/** Optional grouped definitions for callers that already own a RibbonDefinitions object. */
+	definitions?: RibbonDefinitions;
+}
+
+type ControlPlacement = { button: RibbonButton; groupId: string; index: number };
+type ControlOccurrence = ControlPlacement & { tabId: string; ordinal: number; key: string };
+
+function sameModel(a: unknown, b: unknown): boolean {
+	// `sourceXml` records the original XML, not an editable property. It must
+	// not make a freshly parsed but otherwise unchanged definition look dirty.
+	const withoutSource = (value: unknown): unknown => {
+		if (Array.isArray(value)) return value.map(withoutSource);
+		if (value && typeof value === "object") {
+			return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "sourceXml").map(([key, v]) => [key, withoutSource(v)]));
+		}
+		return value;
+	};
+	return JSON.stringify(withoutSource(a)) === JSON.stringify(withoutSource(b));
+}
+
+function byIdUnique<T>(items: T[], id: (item: T) => string, label: string): Map<string, T> {
+	const result = new Map<string, T>();
+	for (const item of items) {
+		const key = id(item);
+		if (result.has(key)) throw new Error(`Ambiguous duplicate ${label} id "${key}"; ribbon import aborted.`);
+		result.set(key, item);
+	}
+	return result;
+}
+
+function controlOccurrences(ribbon: RibbonDefinition): Map<string, ControlOccurrence[]> {
+	const occurrences = new Map<string, ControlOccurrence[]>();
+	for (const tab of ribbon.tabs) {
+		for (const group of tab.groups) {
+			const ordinals = new Map<string, number>();
+			group.buttons.forEach((button, index) => {
+				const ordinal = ordinals.get(button.id) ?? 0;
+				ordinals.set(button.id, ordinal + 1);
+				const key = JSON.stringify([tab.id, group.id, button.id, ordinal]);
+				const previous = occurrences.get(button.id) ?? [];
+				previous.push({ button, groupId: group.id, tabId: tab.id, ordinal, index, key });
+				occurrences.set(button.id, previous);
+			});
+		}
+	}
+	return occurrences;
+}
+
+/** Valid platform control reuse is permitted only when EVERY occurrence remains unedited. */
+function unchangedReusedControlIds(current: RibbonDefinition, baseline: RibbonDefinition): Set<string> {
+	const before = controlOccurrences(baseline);
+	const after = controlOccurrences(current);
+	const reused = new Set<string>();
+	for (const id of new Set([...before.keys(), ...after.keys()])) {
+		const previous = before.get(id) ?? [];
+		const next = after.get(id) ?? [];
+		if (previous.length <= 1 && next.length <= 1) continue;
+		if (previous.length < 2 || next.length !== previous.length) {
+			throw new Error(`Ambiguous duplicate control id "${id}": occurrence added or removed.`);
+		}
+		const nextByKey = new Map(next.map(occurrence => [occurrence.key, occurrence]));
+		for (const occurrence of previous) {
+			const counterpart = nextByKey.get(occurrence.key);
+			if (!counterpart || !sameModel(occurrence.button, counterpart.button)) {
+				throw new Error(`Ambiguous duplicate control id "${id}": a reused platform occurrence was edited or moved.`);
+			}
+		}
+		reused.add(id);
+	}
+	if (!reused.size) return reused;
+	const beforeGroups = new Map(baseline.tabs.flatMap(tab =>
+		tab.groups.map(group => [JSON.stringify([tab.id, group.id]), group] as const)));
+	const afterGroups = new Map(current.tabs.flatMap(tab =>
+		tab.groups.map(group => [JSON.stringify([tab.id, group.id]), group] as const)));
+	const occurrenceOrder = (group: RibbonGroup): string[] => {
+		const ordinals = new Map<string, number>();
+		return group.buttons.map(button => {
+			const ordinal = ordinals.get(button.id) ?? 0;
+			ordinals.set(button.id, ordinal + 1);
+			return JSON.stringify([button.id, ordinal]);
+		});
+	};
+	for (const [groupKey, previous] of beforeGroups) {
+		if (!previous.buttons.some(button => reused.has(button.id))) continue;
+		const next = afterGroups.get(groupKey);
+		if (!next) continue; // Disappearing duplicate occurrences were rejected above.
+		const beforeOrder = occurrenceOrder(previous);
+		const afterOrder = occurrenceOrder(next);
+		const common = new Set(beforeOrder.filter(key => afterOrder.includes(key)));
+		if (!sameModel(beforeOrder.filter(key => common.has(key)), afterOrder.filter(key => common.has(key)))) {
+			throw new Error(`Ambiguous duplicate control in group ${previous.id}: a reused occurrence moved relative to its siblings.`);
+		}
+	}
+	return reused;
+}
+
+function buttonPlacements(ribbon: RibbonDefinition, ignoredIds: ReadonlySet<string> = new Set()): Map<string, ControlPlacement> {
+	const placements = new Map<string, ControlPlacement>();
+	for (const tab of ribbon.tabs) {
+		for (const group of tab.groups) {
+			group.buttons.forEach((button, index) => {
+				if (ignoredIds.has(button.id)) return;
+				if (placements.has(button.id)) throw new Error(`Ambiguous duplicate control id "${button.id}"; ribbon import aborted.`);
+				placements.set(button.id, { button, groupId: group.id, index });
+			});
+		}
+	}
+	return placements;
+}
+
+function reorderedGroupIds(current: RibbonDefinition, baseline: RibbonDefinition, ignoredIds: ReadonlySet<string> = new Set()): Set<string> {
+	const original = new Map(baseline.tabs.flatMap(tab => tab.groups.map(group => [group.id, group] as const)));
+	const beforePlacements = buttonPlacements(baseline, ignoredIds);
+	const reordered = new Set<string>();
+	for (const tab of current.tabs) {
+		for (const group of tab.groups) {
+			const before = original.get(group.id);
+			const editableButtons = group.buttons.filter(button => !ignoredIds.has(button.id));
+			const originalEditableButtons = before?.buttons.filter(button => !ignoredIds.has(button.id)) ?? [];
+			const structuralEdit = !before || editableButtons.length !== originalEditableButtons.length ||
+				editableButtons.some(button => beforePlacements.get(button.id)?.groupId !== group.id);
+			// New/moved controls may retain an old sequence that collides with a
+			// sibling. Normalize the affected group's entire ordered set so CRM
+			// receives stable 10,20,... positions without ambiguous ties.
+			if (structuralEdit && group.buttons.some((button, index) => index > 0 && button.sequence <= group.buttons[index - 1].sequence)) {
+				reordered.add(group.id);
+			}
+			if (!before) continue;
+			// Ignore insertions/removals/relocations here: those have their own intent.
+			const oldOrder = originalEditableButtons.map(b => b.id).filter(id => editableButtons.some(b => b.id === id));
+			const newOrder = editableButtons.map(b => b.id).filter(id => originalEditableButtons.some(b => b.id === id));
+			if (!sameModel(oldOrder, newOrder)) reordered.add(group.id);
+		}
+	}
+	return reordered;
+}
+
+/** Restrict edits of shared definitions to IDs actually used by this ribbon scope. */
+function referencedDefinitions(
+	current: RibbonDefinition,
+	baseline: RibbonDefinition,
+	definitions: RibbonDefinitions,
+	baselineDefinitions?: RibbonDefinitions,
+): { commandIds: Set<string>; enableRuleIds: Set<string>; displayRuleIds: Set<string>; locLabelIds: Set<string> } {
+	const commandIds = new Set<string>();
+	const locLabelIds = new Set<string>();
+	for (const ribbon of [current, baseline]) {
+		for (const tab of ribbon.tabs) {
+			if (tab.commandId) commandIds.add(tab.commandId);
+			locLabelIds.add(`${tab.id}.Title`);
+			for (const group of tab.groups) {
+				locLabelIds.add(`${group.id}.Title`);
+				for (const button of group.buttons) {
+					if (button.commandId) commandIds.add(button.commandId);
+					locLabelIds.add(buttonLabelId(button.id));
+					locLabelIds.add(buttonTooltipTitleId(button.id));
+					locLabelIds.add(buttonTooltipBodyId(button.id));
+					for (const value of [button.label, button.tooltipTitle, button.tooltipBody, button.sourceXml]) {
+						if (!value) continue;
+						for (const ref of value.matchAll(/\$LocLabels:([^\s"'&<>]+)/g)) locLabelIds.add(ref[1]);
+					}
+				}
+			}
+		}
+	}
+	const enableRuleIds = new Set<string>();
+	const displayRuleIds = new Set<string>();
+	for (const command of [...definitions.commands, ...(baselineDefinitions?.commands ?? [])]) {
+		if (!commandIds.has(command.id)) continue;
+		for (const id of command.enableRules) enableRuleIds.add(id);
+		for (const id of command.displayRules) displayRuleIds.add(id);
+	}
+	return { commandIds, enableRuleIds, displayRuleIds, locLabelIds };
 }
 
 /**
@@ -59,8 +235,35 @@ function hasOobOverrideChanges(base: RibbonButton, current: RibbonButton): boole
 	return false;
 }
 
-export function generateRibbonDiffXml(input: GeneratorInput): string {
-	const { current, baseline, commands, enableRules, displayRules, locLabels } = input;
+export function generateRibbonDelta(input: GeneratorInput): RibbonDelta {
+	const { current, baseline, baselineDefinitions } = input;
+	const definitions: RibbonDefinitions = input.definitions ?? {
+		commands: input.commands,
+		enableRules: input.enableRules,
+		displayRules: input.displayRules,
+		locLabels: input.locLabels,
+	};
+	const { commands, enableRules, displayRules, locLabels } = definitions;
+	const unchangedReusedIds = unchangedReusedControlIds(current, baseline);
+	const basePlacements = buttonPlacements(baseline, unchangedReusedIds);
+	const currentPlacements = buttonPlacements(current, unchangedReusedIds);
+	const reorderedGroups = reorderedGroupIds(current, baseline, unchangedReusedIds);
+	for (const tab of current.tabs) {
+		for (const group of tab.groups) {
+			if (reorderedGroups.has(group.id) && group.buttons.some(button => unchangedReusedIds.has(button.id))) {
+				throw new Error(`Ambiguous duplicate control in group ${group.id}: sequence normalization would rewrite an unchanged reused platform control.`);
+			}
+		}
+	}
+	const baselineCommandMap = byIdUnique(baselineDefinitions?.commands ?? [], c => c.id, "baseline command");
+	const baselineEnableMap = byIdUnique(baselineDefinitions?.enableRules ?? [], r => r.id, "baseline enable rule");
+	const baselineDisplayMap = byIdUnique(baselineDefinitions?.displayRules ?? [], r => r.id, "baseline display rule");
+	const baselineLabelMap = byIdUnique(baselineDefinitions?.locLabels ?? [], l => l.id, "baseline localized label");
+	byIdUnique(commands, c => c.id, "command");
+	byIdUnique(enableRules, r => r.id, "enable rule");
+	byIdUnique(displayRules, r => r.id, "display rule");
+	byIdUnique(locLabels, l => l.id, "localized label");
+	const related = referencedDefinitions(current, baseline, definitions, baselineDefinitions);
 
 	const baselineButtonsById = new Map<string, RibbonButton>();
 	const baselineHiddenIds = new Set<string>();
@@ -72,11 +275,23 @@ export function generateRibbonDiffXml(input: GeneratorInput): string {
 		for (const baseGroup of baseTab.groups) {
 			baselineGroupIds.add(baseGroup.id);
 			for (const baseButton of baseGroup.buttons) {
+				if (unchangedReusedIds.has(baseButton.id)) continue;
 				baselineButtonsById.set(baseButton.id, baseButton);
 				if (baseButton.hidden) baselineHiddenIds.add(baseButton.id);
 			}
 		}
 	}
+	byIdUnique(current.tabs, t => t.id, "tab");
+	byIdUnique(baseline.tabs, t => t.id, "baseline tab");
+	const currentGroups = byIdUnique(current.tabs.flatMap(t => t.groups), g => g.id, "group");
+	const baselineGroups = byIdUnique(baseline.tabs.flatMap(t => t.groups), g => g.id, "baseline group");
+	const previousTabs = new Map(baseline.tabs.map(t => [t.id, t]));
+	const removedTabIds = baseline.tabs.filter(t => !current.tabs.some(c => c.id === t.id)).map(t => t.id);
+	const removedGroupIds = [...baselineGroups.keys()].filter(id => !currentGroups.has(id));
+	const removedControlIds = [...basePlacements.keys()].filter(id => !currentPlacements.has(id));
+	const unhiddenControlIds = [...currentPlacements.entries()]
+		.filter(([id, placement]) => basePlacements.get(id)?.button.hidden && !placement.button.hidden)
+		.map(([id]) => id);
 
 	const tabCustomActions: string[] = [];
 	const groupCustomActions: string[] = [];
@@ -88,6 +303,44 @@ export function generateRibbonDiffXml(input: GeneratorInput): string {
 	// `sink` accumulates; we dedupe by Id at the end.
 	const collectedLocLabels: LocLabel[] = [];
 	const sink = (label: LocLabel) => collectedLocLabels.push(label);
+	const elementPatches: NonNullable<RibbonDelta["elementPatches"]> = [];
+	const sameSharedOrder = (prior: string[], next: string[]): boolean => {
+		const shared = new Set(prior.filter(id => next.includes(id)));
+		return sameModel(prior.filter(id => shared.has(id)), next.filter(id => shared.has(id)));
+	};
+	const priorTabIds = baseline.tabs.map(t => t.id);
+	const tabReorder = !sameSharedOrder(priorTabIds, current.tabs.map(t => t.id));
+	const baselineGroupParents = new Map(baseline.tabs.flatMap(t => t.groups.map(g => [g.id, t.id] as const)));
+	for (const [tabIndex, tab] of current.tabs.entries()) {
+		const previous = previousTabs.get(tab.id);
+		if (!previous && tab.sourceXml && tab.sourceXml.includes("<Menu")) {
+			throw new Error(`Unsafe cloning of tab ${tab.id}: an unsupported source subtree would be lost.`);
+		}
+		if (previous) {
+			const attrs: Record<string, string | null> = {};
+			if (tab.label !== previous.label) {
+				attrs.Title = resolveLocalizedAttr(tab.label, `${tab.id}.Title`, locLabels, sink);
+			}
+			if (tab.commandId !== previous.commandId) attrs.Command = tab.commandId || null;
+			if (tab.template !== previous.template) attrs.Template = tab.template || null;
+			if (tabReorder || tab.sequence !== previous.sequence) attrs.Sequence = String(tabReorder ? (tabIndex + 1) * 10 : tab.sequence);
+			if (Object.keys(attrs).length > 0) elementPatches.push({ kind: "Tab", id: tab.id, attributes: attrs });
+		}
+		const originalGroupIds = previous?.groups.map(g => g.id) ?? [];
+		const groupReorder = !sameSharedOrder(originalGroupIds, tab.groups.map(g => g.id));
+		for (const [groupIndex, group] of tab.groups.entries()) {
+			const before = baselineGroups.get(group.id);
+			if (!before) continue;
+			if (baselineGroupParents.get(group.id) !== tab.id) {
+				throw new Error(`Unrepresentable edit of group ${group.id}: moving a whole merged group requires explicit relocation intent.`);
+			}
+			const attrs: Record<string, string | null> = {};
+			if (group.label !== before.label) attrs.Title = resolveLocalizedAttr(group.label, `${group.id}.Title`, locLabels, sink);
+			if (group.template !== before.template) attrs.Template = group.template ? normalizeGroupTemplate(group.template) : null;
+			if (groupReorder || group.sequence !== before.sequence) attrs.Sequence = String(groupReorder ? (groupIndex + 1) * 10 : group.sequence);
+			if (Object.keys(attrs).length > 0) elementPatches.push({ kind: "Group", id: group.id, attributes: attrs });
+		}
+	}
 
 	// The set of buttons that actually produced a CustomAction. Dependency
 	// collection (commands / rules / loc-labels) is scoped to THESE only —
@@ -123,27 +376,29 @@ export function generateRibbonDiffXml(input: GeneratorInput): string {
 	// 3. Buttons.
 	for (const tab of current.tabs) {
 		for (const group of tab.groups) {
-			for (const button of group.buttons) {
-				const baseButton = baselineButtonsById.get(button.id);
-
-				if (button.hidden && !baselineHiddenIds.has(button.id)) {
-					// Visible button the user wants hidden.
-					hideCustomActions.push(generateHideCustomAction(button, group.id));
-				} else if (!baseButton) {
-					// Not in the loaded ribbon → user created it this session →
-					// emit as a new control under its group.
-					customActions.push(generateCustomAction(button, group.id, locLabels, sink));
-					emittedButtons.push(button);
-				} else if (hasOobOverrideChanges(baseButton, button)) {
-					// Present in the loaded ribbon AND modified (icon / label /
-					// tooltip / command etc.) → emit an override CustomAction
-					// (Location = the button's id). Works for an existing custom
-					// button or an OOB one alike.
-					customActions.push(generateOobOverrideCustomAction(button, locLabels, sink));
+			for (const [index, button] of group.buttons.entries()) {
+					if (unchangedReusedIds.has(button.id)) continue;
+					const baseButton = baselineButtonsById.get(button.id);
+				if (baseButton && button.kind !== baseButton.kind) {
+					throw new Error(`Unrepresentable edit of control ${button.id}: changing the control kind requires an explicit replacement.`);
+				}
+				const moved = !!baseButton && basePlacements.get(button.id)?.groupId !== group.id;
+				const reordered = reorderedGroups.has(group.id);
+				const sequence = reordered ? (index + 1) * 10 : button.sequence;
+				const changed = !!baseButton && (hasOobOverrideChanges(baseButton, button) || baseButton.sequence !== button.sequence || reordered);
+				if (!baseButton || moved || changed) {
+					if (moved) removedControlIds.push(button.id);
+					if (!baseButton || moved) {
+						customActions.push(generateCustomAction(button, group.id, locLabels, sink, baseButton, sequence, moved));
+					} else {
+						customActions.push(generateOobOverrideCustomAction(button, locLabels, sink, baseButton, sequence));
+					}
 					emittedButtons.push(button);
 				}
-				// else: unchanged vs. baseline → no diff emitted (correct; it's
-				// already live and additive import leaves it untouched).
+				if (button.hidden && !baselineHiddenIds.has(button.id)) {
+					// A new hidden control requires BOTH creation and the hide action.
+					hideCustomActions.push(generateHideCustomAction(button, group.id));
+				}
 			}
 		}
 	}
@@ -153,18 +408,26 @@ export function generateRibbonDiffXml(input: GeneratorInput): string {
 	for (const button of emittedButtons) {
 		if (button.commandId) referencedCommandIds.add(button.commandId);
 	}
+	for (const command of commands) {
+		if (!related.commandIds.has(command.id)) continue;
+		if (command.actions.some(a => a.kind !== "javascript" && a.kind !== "url")) {
+			throw new Error(`Unsupported authored action in ${command.id}: only JavaScriptFunction and Url can be published as classic RibbonDiffXml.`);
+		}
+		if (!baselineDefinitions && isSystemRibbonId(command.id) && !command.sourceXml && command.actions.length > 0 && referencedCommandIds.has(command.id)) {
+			throw new Error(`System command override ${command.id} requires baselineDefinitions proving a deliberate edit.`);
+		}
+	}
 
-	// Emit command/rule DEFINITIONS only for custom (non-system) elements.
-	// System `Mscrm.*` / `Microsoft.*` commands already exist in the platform —
-	// re-emitting the parser's (often action-less) copy would overwrite and
-	// corrupt them. The one deliberate exception is an intentional system-command
-	// OVERRIDE (e.g. `Mscrm.OpenRecordItem` with a custom JS action), which must
-	// be emitted for Dataverse to pick it up. We distinguish by checking whether
-	// the command has at least one action defined: a parsed-but-unmodified OOB
-	// command has no actions (the parser only understands JS/URL); a deliberate
-	// override always has actions.
+	// A loaded Mscrm.* command can contain JavaScript actions. Action count is
+	// therefore NOT proof that a user intentionally overrode it. Only explicitly
+	// changed definitions or newly-authored ones are safe to serialize.
 	const referencedCommands = commands.filter(
-		(c) => referencedCommandIds.has(c.id) && (!isSystemRibbonId(c.id) || c.actions.length > 0),
+		(c) => {
+			if (!related.commandIds.has(c.id)) return false;
+			const previous = baselineCommandMap.get(c.id);
+			if (baselineDefinitions) return !previous || !sameModel(previous, c);
+			return referencedCommandIds.has(c.id) && !c.sourceXml && !isSystemRibbonId(c.id);
+		},
 	);
 
 	const referencedEnableRuleIds = new Set<string>();
@@ -174,17 +437,31 @@ export function generateRibbonDiffXml(input: GeneratorInput): string {
 		cmd.displayRules.forEach((r) => referencedDisplayRuleIds.add(r));
 	}
 
-	const referencedEnableRules = enableRules.filter(
-		(r) => referencedEnableRuleIds.has(r.id) && !isSystemRibbonId(r.id),
+	const referencedEnableRules = enableRules.filter((r) => {
+		if (!related.enableRuleIds.has(r.id) && !referencedEnableRuleIds.has(r.id)) return false;
+		const previous = baselineEnableMap.get(r.id);
+		if (baselineDefinitions) return !previous || !sameModel(previous, r);
+		return referencedEnableRuleIds.has(r.id) && !r.sourceXml && !isSystemRibbonId(r.id);
+	});
+	const referencedDisplayRules = displayRules.filter((r) => {
+		if (!related.displayRuleIds.has(r.id) && !referencedDisplayRuleIds.has(r.id)) return false;
+		const previous = baselineDisplayMap.get(r.id);
+		if (baselineDefinitions) return !previous || !sameModel(previous, r);
+		return referencedDisplayRuleIds.has(r.id) && !r.sourceXml && !isSystemRibbonId(r.id);
+	});
+	const changedLabels = locLabels.filter((l) =>
+		baselineDefinitions && related.locLabelIds.has(l.id) &&
+		(!baselineLabelMap.has(l.id) || !sameModel(baselineLabelMap.get(l.id), l)),
 	);
-	const referencedDisplayRules = displayRules.filter(
-		(r) => referencedDisplayRuleIds.has(r.id) && !isSystemRibbonId(r.id),
-	);
-	const referencedLocLabels = dedupeLocLabels(collectedLocLabels);
+	const referencedLocLabels = dedupeLocLabels([...collectedLocLabels, ...changedLabels]);
+	const removedCommandIds = [...baselineCommandMap.keys()].filter(id => related.commandIds.has(id) && !commands.some(c => c.id === id));
+	const removedEnableRuleIds = [...baselineEnableMap.keys()].filter(id => related.enableRuleIds.has(id) && !enableRules.some(r => r.id === id));
+	const removedDisplayRuleIds = [...baselineDisplayMap.keys()].filter(id => related.displayRuleIds.has(id) && !displayRules.some(r => r.id === id));
+	const removedLocLabelIds = [...baselineLabelMap.keys()].filter(id => related.locLabelIds.has(id) && !locLabels.some(l => l.id === id));
 
-	const commandDefsXml = referencedCommands.map(generateCommandDefinition).join("\n    ");
-	const enableRulesXml = referencedEnableRules.map(generateEnableRule).join("\n      ");
-	const displayRulesXml = referencedDisplayRules.map(generateDisplayRule).join("\n      ");
+	const commandDefsXml = referencedCommands.map(c => generateCommandDefinition(c, baselineCommandMap.get(c.id))).join("\n    ");
+	const enableRulesXml = referencedEnableRules.map(r => generateEnableRule(r, baselineEnableMap.get(r.id))).join("\n      ");
+	const displayRulesXml = referencedDisplayRules.map(r => generateDisplayRule(r, baselineDisplayMap.get(r.id))).join("\n      ");
 	const locLabelsXml = referencedLocLabels.map(generateLocLabel).join("\n    ");
 
 	const allCustomActions = [
@@ -194,13 +471,16 @@ export function generateRibbonDiffXml(input: GeneratorInput): string {
 		...hideCustomActions,
 	];
 
-	// Collect tab display rules from all tabs that have them
-	const tabDisplayRulesXml = current.tabs
-		.filter((t) => t.tabDisplayRules && t.tabDisplayRules.length > 0)
-		.map(generateTabDisplayRulesForTab)
-		.join("\n      ");
+	const originalTabRules = byIdUnique(baseline.tabs.flatMap(t => t.tabDisplayRules), r => r.tabCommand, "baseline tab display rule");
+	const editedTabRules = byIdUnique(current.tabs.flatMap(t => t.tabDisplayRules), r => r.tabCommand, "tab display rule");
+	const removedTabDisplayRuleCommands = [...originalTabRules.keys()].filter(id => !editedTabRules.has(id));
+	const tabDisplayRulesXml = current.tabs.map(tab => {
+		const changed = tab.tabDisplayRules.filter(rule => !originalTabRules.has(rule.tabCommand) || !sameModel(originalTabRules.get(rule.tabCommand), rule));
+		return changed.length ? generateTabDisplayRulesForTab({ ...tab, tabDisplayRules: changed }) : "";
+	}).filter(Boolean).join("\n      ");
 
 	const scalingXml = generateScalingsXml(current, baseline);
+	const removedScalingTabIds = Object.keys(baseline.scalingByTab ?? {}).filter(id => !current.scalingByTab?.[id]);
 
 	// IMPORTANT — no `<?xml ?>` declaration here.
 	//
@@ -215,11 +495,10 @@ export function generateRibbonDiffXml(input: GeneratorInput): string {
 	// If you need a standalone, viewable XML string (e.g. for the XML drawer
 	// or a download button), prepend `<?xml version="1.0" encoding="utf-8"?>\n`
 	// at the call site.
-	return `<RibbonDiffXml>
+	const xml = `<RibbonDiffXml>
   <CustomActions>
     ${allCustomActions.join("\n    ")}
   </CustomActions>
-  <Templates><RibbonTemplates Id="Mscrm.Templates"/></Templates>
   <CommandDefinitions>
     ${commandDefsXml}
   </CommandDefinitions>
@@ -239,6 +518,25 @@ export function generateRibbonDiffXml(input: GeneratorInput): string {
     ${locLabelsXml}
   </LocLabels>
 </RibbonDiffXml>`;
+	return {
+		xml,
+		elementPatches,
+		removedControlIds: [...new Set(removedControlIds)],
+		removedGroupIds,
+		removedTabIds,
+		unhiddenControlIds,
+		removedCommandIds,
+		removedEnableRuleIds,
+		removedDisplayRuleIds,
+		removedLocLabelIds,
+		removedTabDisplayRuleCommands,
+		removedScalingTabIds,
+	};
+}
+
+/** Compatibility for existing XML preview and publish callers. */
+export function generateRibbonDiffXml(input: GeneratorInput): string {
+	return generateRibbonDelta(input).xml;
 }
 
 /**
@@ -259,13 +557,25 @@ export interface RibbonDiffSummary {
 	newGroups: number;
 	scalingChanges: number;
 	tabDisplayRules: number;
+	removedControls: number;
+	unhiddenControls: number;
+	movedControls: number;
+	reorderedGroups: number;
+	reorderedTabs: number;
+	reorderedGroupContainers: number;
+	changedTabs: number;
+	changedGroups: number;
+	changedDefinitions: number;
 	hasAnyChange: boolean;
 }
 
 export function summarizeRibbonDiff(
 	current: RibbonDefinition,
 	baseline: RibbonDefinition,
+	definitions?: RibbonDefinitions,
+	baselineDefinitions?: RibbonDefinitions,
 ): RibbonDiffSummary {
+	const unchangedReusedIds = unchangedReusedControlIds(current, baseline);
 	const baselineButtonsById = new Map<string, RibbonButton>();
 	const baselineHiddenIds = new Set<string>();
 	const baselineTabIds = new Set<string>();
@@ -276,6 +586,7 @@ export function summarizeRibbonDiff(
 		for (const baseGroup of baseTab.groups) {
 			baselineGroupIds.add(baseGroup.id);
 			for (const baseButton of baseGroup.buttons) {
+				if (unchangedReusedIds.has(baseButton.id)) continue;
 				baselineButtonsById.set(baseButton.id, baseButton);
 				if (baseButton.hidden) baselineHiddenIds.add(baseButton.id);
 			}
@@ -288,37 +599,99 @@ export function summarizeRibbonDiff(
 	let newTabs = 0;
 	let newGroups = 0;
 	let tabDisplayRules = 0;
+	let changedTabs = 0;
+	let changedGroups = 0;
+	const placements = buttonPlacements(current, unchangedReusedIds);
+	const basePlacements = buttonPlacements(baseline, unchangedReusedIds);
+	const removedControls = [...basePlacements.keys()].filter(id => !placements.has(id)).length;
+	const unhiddenControls = [...placements.entries()].filter(([id, p]) => basePlacements.get(id)?.button.hidden && !p.button.hidden).length;
+	const movedControls = [...placements.entries()].filter(([id, p]) => {
+		const before = basePlacements.get(id);
+		return !!before && before.groupId !== p.groupId;
+	}).length;
+	const reorderedGroupIdsForSummary = reorderedGroupIds(current, baseline, unchangedReusedIds);
+	for (const tab of current.tabs) {
+		for (const group of tab.groups) {
+			if (reorderedGroupIdsForSummary.has(group.id) && group.buttons.some(button => unchangedReusedIds.has(button.id))) {
+				throw new Error(`Ambiguous duplicate control in group ${group.id}: sequence normalization would rewrite a reused platform control.`);
+			}
+		}
+	}
+	const reorderedGroups = reorderedGroupIdsForSummary.size;
+	const originalTabs = new Map(baseline.tabs.map(t => [t.id, t]));
+	const originalGroups = new Map(baseline.tabs.flatMap(t => t.groups.map(g => [g.id, g] as const)));
+	const changedRelativeOrder = (before: string[], after: string[]): boolean => {
+		const shared = new Set(before.filter(id => after.includes(id)));
+		return !sameModel(before.filter(id => shared.has(id)), after.filter(id => shared.has(id)));
+	};
+	const reorderedTabs = changedRelativeOrder(baseline.tabs.map(t => t.id), current.tabs.map(t => t.id)) ? 1 : 0;
+	const reorderedGroupContainers = current.tabs.filter(tab => {
+		const previous = originalTabs.get(tab.id);
+		return previous && changedRelativeOrder(previous.groups.map(g => g.id), tab.groups.map(g => g.id));
+	}).length;
+	const baselineTabRules = new Map(baseline.tabs.flatMap(t => t.tabDisplayRules.map(r => [r.tabCommand, r] as const)));
 
 	for (const tab of current.tabs) {
 		if (!baselineTabIds.has(tab.id)) newTabs++;
-		if (tab.tabDisplayRules && tab.tabDisplayRules.length > 0) {
-			tabDisplayRules += tab.tabDisplayRules.length;
+		else if (originalTabs.has(tab.id)) {
+			const before = originalTabs.get(tab.id)!;
+			if (before.label !== tab.label || before.sequence !== tab.sequence || before.commandId !== tab.commandId || before.template !== tab.template) changedTabs++;
+		}
+		for (const rule of tab.tabDisplayRules ?? []) {
+			if (!baselineTabRules.has(rule.tabCommand) || !sameModel(rule, baselineTabRules.get(rule.tabCommand))) tabDisplayRules++;
 		}
 		for (const group of tab.groups) {
 			if (!baselineGroupIds.has(group.id) && baselineTabIds.has(tab.id)) newGroups++;
+			else if (originalGroups.has(group.id)) {
+				const before = originalGroups.get(group.id)!;
+				if (before.label !== group.label || before.template !== group.template || before.sequence !== group.sequence) changedGroups++;
+			}
 			for (const button of group.buttons) {
+				if (unchangedReusedIds.has(button.id)) continue;
 				const baseButton = baselineButtonsById.get(button.id);
 				if (button.hidden && !baselineHiddenIds.has(button.id)) {
 					hiddenButtons++;
 				} else if (!baseButton) {
 					newButtons++;
-				} else if (hasOobOverrideChanges(baseButton, button)) {
+				} else if (hasOobOverrideChanges(baseButton, button) || baseButton.sequence !== button.sequence || baseButton.kind !== button.kind) {
 					overriddenButtons++;
 				}
 			}
 		}
 	}
+	tabDisplayRules += [...baselineTabRules.keys()].filter(id => !current.tabs.some(t => t.tabDisplayRules.some(r => r.tabCommand === id))).length;
+	const removedTabs = baseline.tabs.filter(t => !current.tabs.some(c => c.id === t.id)).length;
+	const removedGroups = [...originalGroups.keys()].filter(id => !current.tabs.some(t => t.groups.some(g => g.id === id))).length;
 
 	// Scaling: count distinct tabs whose scaling differs from baseline.
 	const currentScaling = current.scalingByTab ?? {};
 	const baselineScaling = baseline.scalingByTab ?? {};
 	let scalingChanges = 0;
 	for (const [tabId, scaling] of Object.entries(currentScaling)) {
-		if (JSON.stringify(scaling) !== JSON.stringify(baselineScaling[tabId])) scalingChanges++;
+		if (!sameModel(scaling, baselineScaling[tabId])) scalingChanges++;
+	}
+	scalingChanges += Object.keys(baselineScaling).filter(id => currentScaling[id] === undefined).length;
+	let changedDefinitions = 0;
+	if (definitions && baselineDefinitions) {
+		const ids = referencedDefinitions(current, baseline, definitions, baselineDefinitions);
+		for (const [kind, used] of [
+			["commands", ids.commandIds],
+			["enableRules", ids.enableRuleIds],
+			["displayRules", ids.displayRuleIds],
+			["locLabels", ids.locLabelIds],
+		] as const) {
+			const before = new Map(baselineDefinitions[kind].map(item => [item.id, item]));
+			const after = new Map(definitions[kind].map(item => [item.id, item]));
+			for (const id of new Set([...before.keys(), ...after.keys()])) {
+				if (used.has(id) && !sameModel(before.get(id), after.get(id))) changedDefinitions++;
+			}
+		}
 	}
 
 	const hasAnyChange =
-		newButtons + overriddenButtons + hiddenButtons + newTabs + newGroups + scalingChanges > 0;
+		newButtons + overriddenButtons + hiddenButtons + newTabs + newGroups + scalingChanges +
+		removedTabs + removedGroups + removedControls + unhiddenControls + movedControls + reorderedGroups + reorderedTabs + reorderedGroupContainers +
+		changedTabs + changedGroups + changedDefinitions + tabDisplayRules > 0;
 
 	return {
 		newButtons,
@@ -328,6 +701,15 @@ export function summarizeRibbonDiff(
 		newGroups,
 		scalingChanges,
 		tabDisplayRules,
+		removedControls,
+		unhiddenControls,
+		movedControls,
+		reorderedGroups,
+		reorderedTabs,
+		reorderedGroupContainers,
+		changedTabs,
+		changedGroups,
+		changedDefinitions,
 		hasAnyChange,
 	};
 }
@@ -337,7 +719,7 @@ function generateScalingsXml(current: RibbonDefinition, baseline: RibbonDefiniti
 	const baselineScaling = baseline.scalingByTab ?? {};
 	const changed = Object.entries(currentScaling)
 		.filter(
-			([tabId, scaling]) => JSON.stringify(scaling) !== JSON.stringify(baselineScaling[tabId]),
+			([tabId, scaling]) => !sameModel(scaling, baselineScaling[tabId]),
 		)
 		.map(([_, scaling]) => scaling);
 
@@ -352,6 +734,35 @@ function generateScalingsXml(current: RibbonDefinition, baseline: RibbonDefiniti
 }
 
 function generateScalingDefinition(scaling: ScalingDefinition): string {
+	if (scaling.sourceXml) {
+		const original = parseSourceElement(scaling.sourceXml, "Scaling", scaling.tabId);
+		original.setAttribute("TabId", scaling.tabId);
+		const inputSteps = [
+			...scaling.maxSizes.map(step => ({ tag: "MaxSize" as const, step })),
+			...scaling.scales.map(step => ({ tag: "Scale" as const, step })),
+		];
+		const prior = [...original.children];
+		if (prior.some(child => child.tagName !== "MaxSize" && child.tagName !== "Scale")) {
+			throw new Error(`Unsafe partial rewrite of scaling ${scaling.tabId}: unknown child XML.`);
+		}
+		const seenSteps = new Set<string>();
+		const authored = inputSteps.map(({ tag, step }) => {
+			const key = `${tag}:${step.id}`;
+			if (seenSteps.has(key)) throw new Error(`Duplicate scaling item ${step.id} in ${scaling.tabId}.`);
+			seenSteps.add(key);
+			const candidates = prior.filter(el => el.tagName === tag && el.getAttribute("Id") === step.id);
+			if (candidates.length > 1) throw new Error(`Ambiguous duplicate scaling declaration ${step.id}.`);
+			const element = candidates[0] ?? original.ownerDocument.createElement(tag);
+			element.setAttribute("Id", step.id);
+			element.setAttribute("GroupId", step.groupId);
+			element.setAttribute("Size", step.size);
+			element.setAttribute("Sequence", String(step.sequence));
+			return element;
+		});
+		for (const old of prior) original.removeChild(old);
+		for (const child of authored) original.appendChild(child);
+		return new XMLSerializer().serializeToString(original);
+	}
 	const maxSizeXml = scaling.maxSizes
 		.map(
 			(step) =>
@@ -380,13 +791,16 @@ function generateCustomAction(
 	groupId: string,
 	storeLocLabels: LocLabel[],
 	sink: (label: LocLabel) => void,
+	baseButton?: RibbonButton,
+	sequence = button.sequence,
+	isMove = false,
 ): string {
 	const location = `${groupId}.Controls._children`;
-	return `<CustomAction Id="${escapeXml(button.id)}.CustomAction"
+	return `<CustomAction Id="${escapeXml(button.id)}.${isMove ? "Move." : ""}CustomAction"
     Location="${escapeXml(location)}"
-    Sequence="${button.sequence}">
-    <CommandUIDefinition>
-      ${generateButtonElement(button, storeLocLabels, sink)}
+	    Sequence="${sequence}">
+	    <CommandUIDefinition>
+	      ${generateButtonElement(button, storeLocLabels, sink, baseButton, sequence)}
     </CommandUIDefinition>
   </CustomAction>`;
 }
@@ -395,14 +809,16 @@ function generateOobOverrideCustomAction(
 	button: RibbonButton,
 	storeLocLabels: LocLabel[],
 	sink: (label: LocLabel) => void,
+	baseButton?: RibbonButton,
+	sequence = button.sequence,
 ): string {
 	// Override: Location = existing button ID (MS-documented pattern for
 	// "change the definition of an existing item").
 	return `<CustomAction Id="${escapeXml(button.id)}.Override.CustomAction"
     Location="${escapeXml(button.id)}"
-    Sequence="${button.sequence}">
-    <CommandUIDefinition>
-      ${generateButtonElement(button, storeLocLabels, sink)}
+	    Sequence="${sequence}">
+	    <CommandUIDefinition>
+	      ${generateButtonElement(button, storeLocLabels, sink, baseButton, sequence)}
     </CommandUIDefinition>
   </CustomAction>`;
 }
@@ -536,8 +952,49 @@ function generateButtonElement(
 	button: RibbonButton,
 	storeLocLabels: LocLabel[],
 	sink: (label: LocLabel) => void,
+	baseButton?: RibbonButton,
+	sequence = button.sequence,
 ): string {
 	const tag = buttonKindToTag(button.kind);
+	if (button.sourceXml) {
+		// Patch ONLY edited known attributes in the original subtree. A flyout
+		// may contain whole Menus and vendor extension attributes that the visual
+		// model does not understand. Serializing from RibbonButton would erase them.
+		const el = parseSourceElement(button.sourceXml, tag, button.id);
+		if (el.getAttribute("Id") !== button.id && el.querySelector("[Id]")) {
+			throw new Error(`Unsafe cloning of nested control ${button.id}: copied menu child IDs would be duplicated.`);
+		}
+		const changed = <T,>(key: keyof RibbonButton, actual: T) => !baseButton || !sameModel(baseButton[key], actual);
+		el.setAttribute("Id", button.id);
+		el.setAttribute("Sequence", String(sequence));
+		if (changed("label", button.label)) {
+			el.setAttribute("LabelText", resolveLocalizedAttr(button.label, buttonLabelId(button.id), storeLocLabels, sink));
+		}
+		if (changed("commandId", button.commandId)) {
+			if (button.commandId) el.setAttribute("Command", button.commandId);
+			else el.removeAttribute("Command");
+		}
+		if (changed("templateAlias", button.templateAlias)) el.setAttribute("TemplateAlias", button.templateAlias);
+		if (changed("tooltipTitle", button.tooltipTitle)) {
+			if (button.tooltipTitle) el.setAttribute("ToolTipTitle", resolveLocalizedAttr(button.tooltipTitle, buttonTooltipTitleId(button.id), storeLocLabels, sink));
+			else el.removeAttribute("ToolTipTitle");
+		}
+		if (changed("tooltipBody", button.tooltipBody)) {
+			if (button.tooltipBody) el.setAttribute("ToolTipDescription", resolveLocalizedAttr(button.tooltipBody, buttonTooltipBodyId(button.id), storeLocLabels, sink));
+			else el.removeAttribute("ToolTipDescription");
+		}
+		if (changed("icon", button.icon) || changed("image32", button.image32) || changed("image16", button.image16)) {
+			const valid = (value?: string) => !!value && (value.startsWith("$webresource:") || value.startsWith("$Resources:"));
+			const modern = [button.image32, button.image16, button.icon].find(valid);
+			if (modern) el.setAttribute("ModernImage", modern);
+			else el.removeAttribute("ModernImage");
+			if (valid(button.image16)) el.setAttribute("Image16by16", button.image16!);
+			else if (changed("image16", button.image16)) el.removeAttribute("Image16by16");
+			if (valid(button.image32)) el.setAttribute("Image32by32", button.image32!);
+			else if (changed("image32", button.image32)) el.removeAttribute("Image32by32");
+		}
+		return new XMLSerializer().serializeToString(el);
+	}
 	const labelAttr = resolveLocalizedAttr(
 		button.label,
 		buttonLabelId(button.id),
@@ -566,30 +1023,39 @@ function generateButtonElement(
 		: "";
 	const tooltipTitleAttr = button.tooltipTitle
 		? ` ToolTipTitle="${escapeXml(
-				resolveLocalizedAttr(
-					button.tooltipTitle,
-					buttonTooltipTitleId(button.id),
-					storeLocLabels,
-					sink,
-				),
-			)}"`
+			resolveLocalizedAttr(
+				button.tooltipTitle,
+				buttonTooltipTitleId(button.id),
+				storeLocLabels,
+				sink,
+			),
+		)}"`
 		: "";
 	const tooltipBodyAttr = button.tooltipBody
 		? ` ToolTipDescription="${escapeXml(
-				resolveLocalizedAttr(
-					button.tooltipBody,
-					buttonTooltipBodyId(button.id),
-					storeLocLabels,
-					sink,
-				),
-			)}"`
+			resolveLocalizedAttr(
+				button.tooltipBody,
+				buttonTooltipBodyId(button.id),
+				storeLocLabels,
+				sink,
+			),
+		)}"`
 		: "";
 	const commandAttr = button.commandId ? ` Command="${escapeXml(button.commandId)}"` : "";
 
 	return `<${tag} Id="${escapeXml(button.id)}"${commandAttr}
       LabelText="${escapeXml(labelAttr)}"${tooltipTitleAttr}${tooltipBodyAttr}
       TemplateAlias="${escapeXml(button.templateAlias)}"
-      Sequence="${button.sequence}"${iconAttr}${image16Attr}${image32Attr}/>`;
+	      Sequence="${sequence}"${iconAttr}${image16Attr}${image32Attr}/>`;
+}
+
+function parseSourceElement(sourceXml: string, tagName: string, id: string): Element {
+	const doc = new DOMParser().parseFromString(sourceXml, "application/xml");
+	const el = doc.documentElement;
+	if (doc.querySelector("parsererror") || el.tagName !== tagName) {
+		throw new Error(`Unsafe partial rewrite of ${id}: original ${tagName} XML is invalid or incompatible.`);
+	}
+	return el;
 }
 
 /**
@@ -633,7 +1099,53 @@ function buttonKindToTag(kind: RibbonButton["kind"]): string {
 // Command definition generators
 // ---------------------------------------------------------------------------
 
-function generateCommandDefinition(cmd: CommandDefinition): string {
+function generateCommandDefinition(cmd: CommandDefinition, baseline?: CommandDefinition): string {
+	for (const action of cmd.actions) {
+		if (action.kind !== "javascript" && action.kind !== "url") {
+			throw new Error(`Unsupported authored ${action.kind} action in ${cmd.id}: classic RibbonDiffXml cannot serialize this action safely.`);
+		}
+	}
+	if (cmd.sourceXml) {
+		const original = parseSourceElement(cmd.sourceXml, "CommandDefinition", cmd.id);
+		const actionsChanged = !baseline || !sameModel(baseline.actions, cmd.actions);
+		if (actionsChanged) {
+			for (const action of [...original.querySelectorAll(":scope > Actions > *")]) {
+				const allowed = action.tagName === "JavaScriptFunction"
+					? new Set(["Library", "FunctionName"])
+					: action.tagName === "Url"
+						? new Set(["Address", "PassParams", "WinMode"])
+						: null;
+				if (!allowed || [...action.attributes].some(attr => !allowed.has(attr.name)) ||
+					[...action.children].some(child =>
+						!["CrmParameter", "BoolParameter", "IntParameter", "DecimalParameter", "StringParameter"].includes(child.tagName) ||
+						[...child.attributes].some(attr => attr.name !== "Name" && attr.name !== "Value") ||
+						child.children.length > 0,
+					) || [...action.childNodes].some(node =>
+						(node.nodeType === Node.TEXT_NODE && !!node.textContent?.trim()) ||
+						(node.nodeType !== Node.TEXT_NODE && node.nodeType !== Node.ELEMENT_NODE),
+					)) {
+					throw new Error(`Unsafe partial rewrite of ${cmd.id}: unrecognized action XML would be discarded.`);
+				}
+			}
+		}
+		const serialized = generateCommandDefinition({ ...cmd, sourceXml: undefined });
+		const replacement = parseSourceElement(serialized, "CommandDefinition", cmd.id);
+		for (const [container, updated] of [
+			["EnableRules", !baseline || !sameModel(baseline.enableRules, cmd.enableRules)],
+			["DisplayRules", !baseline || !sameModel(baseline.displayRules, cmd.displayRules)],
+			["Actions", actionsChanged],
+		] as const) {
+			if (!updated) continue;
+			const old = original.querySelector(`:scope > ${container}`);
+			if (old && container !== "Actions" && [...old.children].some(e => e.tagName !== container.slice(0, -1))) {
+				throw new Error(`Unsafe partial rewrite of ${cmd.id}: unknown ${container} reference XML.`);
+			}
+			const next = replacement.querySelector(`:scope > ${container}`)!;
+			if (old) old.replaceWith(original.ownerDocument.importNode(next, true));
+			else original.appendChild(original.ownerDocument.importNode(next, true));
+		}
+		return new XMLSerializer().serializeToString(original);
+	}
 	const enableRulesXml = cmd.enableRules
 		.map((r) => `<EnableRule Id="${escapeXml(r)}"/>`)
 		.join("\n        ");
@@ -657,8 +1169,7 @@ function generateCommandDefinition(cmd: CommandDefinition): string {
           ${paramsXml}
         </Url>`;
 			}
-			// Classic ribbon serialization currently supports JavaScriptFunction and Url only.
-			return "";
+			throw new Error(`Unsupported authored action in ${cmd.id}.`);
 		})
 		.filter(Boolean)
 		.join("\n        ");
@@ -696,18 +1207,63 @@ function generateActionParam(param: ActionParameter): string {
 // Rule generators
 // ---------------------------------------------------------------------------
 
-function generateEnableRule(rule: EnableRule): string {
+function generateEnableRule(rule: EnableRule, baseline?: EnableRule): string {
+	if (rule.sourceXml) return rewriteRuleSource(rule.sourceXml, "EnableRule", rule.id, rule.steps, baseline?.steps);
 	const steps = rule.steps.map(generateRuleStep).join("\n        ");
 	return `<EnableRule Id="${escapeXml(rule.id)}">
         ${steps}
       </EnableRule>`;
 }
 
-function generateDisplayRule(rule: DisplayRule): string {
+function generateDisplayRule(rule: DisplayRule, baseline?: DisplayRule): string {
+	if (rule.sourceXml) return rewriteRuleSource(rule.sourceXml, "DisplayRule", rule.id, rule.steps, baseline?.steps);
 	const steps = rule.steps.map(generateRuleStep).join("\n        ");
 	return `<DisplayRule Id="${escapeXml(rule.id)}">
         ${steps}
       </DisplayRule>`;
+}
+
+function rewriteRuleSource(sourceXml: string, tagName: string, id: string, steps: RuleStep[], baselineSteps?: RuleStep[]): string {
+	const original = parseSourceElement(sourceXml, tagName, id);
+	if (baselineSteps && sameModel(steps, baselineSteps)) return new XMLSerializer().serializeToString(original);
+	// A parser may have skipped extension rule kinds. An edit to this rule
+	// cannot safely replace those children with an incomplete supported model.
+	const parsedKindNames = new Set([
+		"SelectionCountRule", "EntityRule", "FormStateRule", "CommandClientTypeRule", "CrmClientTypeRule", "CustomRule", "OrRule",
+		"MiscellaneousPrivilegeRule", "FormTypeRule", "ValueRule", "SkuRule", "HideForTabletExperienceRule", "OrganizationSettingRule",
+		"EntityPrivilegeRule", "EntityPropertyRule", "DeviceTypeRule", "RelationshipTypeRule", "RecordPrivilegeRule", "FormEntityContextRule",
+		"PageRule", "ShowOnQuickActionRule", "ShowOnGridAndQuickActionRule", "ShowOnGridRule", "ReferencingAttributeRequiredRule",
+		"OutlookItemTrackingRule", "OutlookRenderTypeRule", "OutlookVersionRule", "CrmOfflineAccessStateRule",
+		"CrmOutlookClientTypeRule", "CrmOutlookClientVersionRule", "OptionSetRule",
+	]);
+	if ([...original.children].some(e => !parsedKindNames.has(e.tagName))) {
+		throw new Error(`Unsafe partial rewrite of ${id}: unknown rule XML would be removed.`);
+	}
+	const canonical = new DOMParser().parseFromString(`<Rule>${(baselineSteps ?? steps).map(generateRuleStep).join("")}</Rule>`, "application/xml");
+	if (canonical.querySelector("parsererror")) throw new Error(`Cannot validate source rule ${id}.`);
+	const validateModeledElement = (actual: Element, expected: Element | undefined): void => {
+		if (!expected || actual.tagName !== expected.tagName ||
+			[...actual.attributes].some(attribute => !expected.hasAttribute(attribute.name))) {
+			throw new Error(`Unsafe partial rewrite of ${id}: unknown rule attributes or nodes would be removed.`);
+		}
+		const actualChildren = [...actual.children];
+		const expectedChildren = [...expected.children];
+		if (actualChildren.length !== expectedChildren.length) {
+			throw new Error(`Unsafe partial rewrite of ${id}: nested rule XML differs from the editable model.`);
+		}
+		actualChildren.forEach((child, index) => validateModeledElement(child, expectedChildren[index]));
+	};
+	const existingSteps = [...original.children];
+	const modeledSteps = [...canonical.documentElement.children];
+	if (existingSteps.length !== modeledSteps.length) {
+		throw new Error(`Unsafe partial rewrite of ${id}: parsed rule definition omitted unknown steps.`);
+	}
+	existingSteps.forEach((child, index) => validateModeledElement(child, modeledSteps[index]));
+	const doc = new DOMParser().parseFromString(`<Rule>${steps.map(generateRuleStep).join("")}</Rule>`, "application/xml");
+	if (doc.querySelector("parsererror")) throw new Error(`Cannot serialize edited rule ${id}.`);
+	for (const child of [...original.children]) original.removeChild(child);
+	for (const child of [...doc.documentElement.children]) original.appendChild(original.ownerDocument.importNode(child, true));
+	return new XMLSerializer().serializeToString(original);
 }
 
 function generateRuleStep(step: RuleStep): string {
@@ -826,6 +1382,29 @@ function generateRuleStep(step: RuleStep): string {
 // ---------------------------------------------------------------------------
 
 function generateLocLabel(label: LocLabel): string {
+	if (label.sourceXml) {
+		const original = parseSourceElement(label.sourceXml, "LocLabel", label.id);
+		let titles = original.querySelector(":scope > Titles");
+		if (!titles) {
+			titles = original.ownerDocument.createElement("Titles");
+			original.appendChild(titles);
+		}
+		const seen = new Set<number>();
+		const existing = [...titles.querySelectorAll(":scope > Title")];
+		for (const current of label.titles) {
+			if (seen.has(current.languageCode)) throw new Error(`Duplicate language ${current.languageCode} for LocLabel ${label.id}.`);
+			seen.add(current.languageCode);
+			const child = existing.find(el => Number(el.getAttribute("languagecode")) === current.languageCode);
+			const target = child ?? original.ownerDocument.createElement("Title");
+			target.setAttribute("languagecode", String(current.languageCode));
+			target.setAttribute("description", current.description);
+			if (!child) titles.appendChild(target);
+		}
+		for (const prior of existing) {
+			if (!seen.has(Number(prior.getAttribute("languagecode")))) titles.removeChild(prior);
+		}
+		return new XMLSerializer().serializeToString(original);
+	}
 	const titles = label.titles
 		.map(
 			(t) => `<Title languagecode="${t.languageCode}" description="${escapeXml(t.description)}"/>`,
@@ -858,6 +1437,36 @@ function generateTabDisplayRulesForTab(tab: import("@/types/ribbon").RibbonTab):
 				})
 				.filter(Boolean)
 				.join("\n          ");
+			if (tdr.sourceXml) {
+				const original = parseSourceElement(tdr.sourceXml, "TabDisplayRule", tdr.tabCommand);
+				const existing = original.querySelector(":scope > DisplayRules");
+				const direct = [...original.children].filter(child => child.tagName !== "DisplayRules");
+				const originalSteps = existing ? [...existing.children] : direct;
+				if (originalSteps.length) {
+					for (const rule of originalSteps) {
+						const allowed = rule.tagName === "EntityRule"
+							? new Set(["AppliesTo", "EntityName", "Context"])
+							: rule.tagName === "PageRule" ? new Set(["Address"]) : null;
+						if (!allowed || [...rule.attributes].some(attr => !allowed.has(attr.name)) || rule.children.length > 0) {
+							throw new Error(`Unsafe partial rewrite of tab display rules ${tdr.tabCommand}: unknown rule content would be lost.`);
+						}
+					}
+				}
+				const next = new DOMParser().parseFromString(`<DisplayRules>${stepsXml}</DisplayRules>`, "application/xml");
+				if (next.querySelector("parsererror")) throw new Error(`Cannot serialize tab display rule ${tdr.tabCommand}.`);
+				if (existing) {
+					for (const child of [...existing.children]) existing.removeChild(child);
+					for (const child of [...next.documentElement.children]) existing.appendChild(original.ownerDocument.importNode(child, true));
+				} else if (direct.length) {
+					// CRM ribbon exports also use direct EntityRule/PageRule children.
+					// Preserve the original schema layout and remove superseded rules.
+					for (const child of direct) original.removeChild(child);
+					for (const child of [...next.documentElement.children]) original.appendChild(original.ownerDocument.importNode(child, true));
+				} else {
+					original.appendChild(original.ownerDocument.importNode(next.documentElement, true));
+				}
+				return new XMLSerializer().serializeToString(original);
+			}
 			return `<TabDisplayRule TabCommand="${escapeXml(tdr.tabCommand)}">
         <DisplayRules>
           ${stepsXml}
@@ -895,11 +1504,11 @@ export function wrapInCustomizationsXml(
 	const entityBlock = entityLogicalName
 		? `
   <Entities>
-    <Entity Name="${escapeXml(entityLogicalName)}" unmodified="0">
+	    <Entity unmodified="0">
+	      <Name>${escapeXml(entityLogicalName)}</Name>
       ${scope === "entity" ? ribbonDiffXml : ""}
-      ${
-				scope === "form" && formId
-					? `
+      ${scope === "form" && formId
+			? `
       <FormXml>
         <forms>
           <systemform formid="${escapeXml(formId)}">
@@ -907,8 +1516,8 @@ export function wrapInCustomizationsXml(
           </systemform>
         </forms>
       </FormXml>`
-					: ""
-			}
+			: ""
+		}
     </Entity>
   </Entities>`
 		: "";

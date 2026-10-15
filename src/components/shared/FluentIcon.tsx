@@ -1,5 +1,7 @@
 import React from "react";
 import { tokens } from "@fluentui/react-components";
+import { useSessionStore } from "@/store/sessionStore";
+import { resolveRibbonIconUrl } from "@/utils/ribbonIconUrl";
 import {
 	AddRegular,
 	AddFilled,
@@ -182,7 +184,7 @@ import {
 
 type IconVariant = "regular" | "filled";
 
-type IconComponent = React.ComponentType<any>;
+type IconComponent = React.ComponentType<React.ComponentProps<typeof AppsAddInRegular>>;
 
 function normalizeName(name: string): string {
 	const aliasMap: Record<string, string> = {
@@ -308,6 +310,31 @@ interface FluentIconProps {
 	"aria-hidden"?: boolean;
 }
 
+/** Keep the existing icon frame; fall back to its Fluent glyph if CRM returns 404. */
+const RibbonWebResourceIcon: React.FC<{
+	src: string;
+	size: number;
+	className?: string;
+	style: React.CSSProperties;
+	ariaHidden: boolean;
+	fallback: React.ReactNode;
+}> = ({ src, size, className, style, ariaHidden, fallback }) => {
+	const [failed, setFailed] = React.useState(false);
+	if (failed) return <>{fallback}</>;
+	return (
+		<img
+			src={src}
+			alt=""
+			width={size}
+			height={size}
+			className={className}
+			aria-hidden={ariaHidden}
+			style={{ objectFit: "contain", ...style }}
+			onError={() => setFailed(true)}
+		/>
+	);
+};
+
 export const FluentIcon: React.FC<FluentIconProps> = ({
 	name,
 	size = 20,
@@ -316,60 +343,36 @@ export const FluentIcon: React.FC<FluentIconProps> = ({
 	className,
 	"aria-hidden": ariaHidden = true,
 }) => {
+	const organizationUrl = useSessionStore((state) => state.connectionUrl);
+	const imageUrl = resolveRibbonIconUrl(name, organizationUrl);
 	const normalized = normalizeName(name).replace(/_/g, "");
 	const resolved = ICON_COMPONENTS[normalized];
 	const IconComponent =
 		variant === "filled"
 			? (resolved?.filled ?? resolved?.regular ?? AppsAddInRegular)
 			: (resolved?.regular ?? AppsAddInRegular);
-
-	return (
+	const iconStyle: React.CSSProperties = {
+		display: "inline-block",
+		verticalAlign: "middle",
+		flexShrink: 0,
+		color: tokens.colorNeutralForeground1,
+		...style,
+	};
+	const fallback = (
 		<IconComponent
 			fontSize={size}
 			aria-hidden={ariaHidden}
+			data-cbs-icon-fallback={resolved ? undefined : "true"}
 			className={className}
-			style={{
-				display: "inline-block",
-				verticalAlign: "middle",
-				flexShrink: 0,
-				color: tokens.colorNeutralForeground1,
-				...style,
-			}}
+			style={iconStyle}
 		/>
 	);
+	if (imageUrl) {
+		return <RibbonWebResourceIcon key={imageUrl} src={imageUrl} size={size}
+			className={className} style={iconStyle} ariaHidden={ariaHidden} fallback={fallback} />;
+	}
+
+	return fallback;
 };
 
 export default FluentIcon;
-
-/**
- * Serializes a Fluent icon to standalone SVG markup so it can be uploaded as a
- * Dataverse web resource. Fluent icons render with `fill="currentColor"`, so the
- * uploaded icon themes correctly with the command bar.
- *
- * Returns `null` if the name doesn't resolve to a known icon (caller should fall
- * back to preview-only). Uses a lazy import of `react-dom/server` so it doesn't
- * weigh down the main bundle.
- */
-export async function fluentIconToSvg(
-	name: string,
-	size = 32,
-	variant: IconVariant = "regular",
-): Promise<string | null> {
-	const normalized = normalizeName(name).replace(/_/g, "");
-	const resolved = ICON_COMPONENTS[normalized];
-	const IconComponent =
-		variant === "filled" ? (resolved?.filled ?? resolved?.regular) : resolved?.regular;
-	if (!IconComponent) return null;
-
-	const { renderToStaticMarkup } = await import("react-dom/server");
-	let markup = renderToStaticMarkup(React.createElement(IconComponent, { fontSize: size }));
-	if (!markup.includes("<svg")) return null;
-
-	// Make the file standalone & concretely sized (Fluent renders width/height as
-	// "1em", which has no font-size context inside a web-resource file).
-	if (!markup.includes("xmlns")) {
-		markup = markup.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
-	}
-	markup = markup.replace(/width="1em"/, `width="${size}"`).replace(/height="1em"/, `height="${size}"`);
-	return markup;
-}

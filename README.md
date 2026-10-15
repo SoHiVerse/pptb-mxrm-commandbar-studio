@@ -5,13 +5,19 @@ customizations** — the spiritual successor to [Ribbon Workbench](https://www.d
 reimagined with React 18, Fluent UI v9, and live Dataverse integration via
 [Power Platform ToolBox](https://www.powerplatformtoolbox.com/).
 
+The same editor also has a **native Dynamics 365 CE on-premises v9.1** build,
+hosted as CRM HTML web resources using the existing signed-in browser session.
+See [native deployment and packaging](docs/onpremises.md) and
+[verification status](docs/onpremises-verification.md). The PPTB entry remains
+separate; native hosting does not change authentication in the PPTB desktop host.
+
 ![Version](https://img.shields.io/badge/version-0.5.3--beta.1-orange)
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript)
 ![Fluent UI](https://img.shields.io/badge/Fluent%20UI-v9-0078D4?logo=microsoft)
 ![PPTB Types](https://img.shields.io/badge/%40pptb%2Ftypes-1.2.3-orange)
 ![License](https://img.shields.io/badge/license-AGPL--3.0--only-green)
-![Tests](https://img.shields.io/badge/tests-148%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-Vitest%20%2B%20Node-blue)
 
 > **Classic commands only.** CBS targets Dataverse `RibbonDiffXml` — the
 > classic commanding system. It does not modify Power Fx / Modern Commanding
@@ -40,8 +46,9 @@ reimagined with React 18, Fluent UI v9, and live Dataverse integration via
 ### ⚡ Command Editor
 - JavaScript function: library (with Browse… to Web Resource Browser), function name, positional CrmParameter editor
 - URL action: address, PassParams, WinMode, named CrmParameters with querystring key
-- **Power Fx expression** — inline Monaco editor (syntax-highlighted, word wrap) with variable hints (`ThisRecord`, `Selection`, `Self`) and async-rule note
-- Custom API / Web API action
+- JavaScript and URL actions are supported for classic ribbon publication.
+- Power Fx / Custom API model entries are not silently serialized as classic actions;
+  unsupported authored action kinds are rejected before import.
 - Enable rules + Display rules binding
 - References tab showing exact buttons + tab/group breadcrumb
 - Versions tab from history
@@ -92,10 +99,16 @@ reimagined with React 18, Fluent UI v9, and live Dataverse integration via
 - CBS-specific completions: `$LocLabels:`, `$webresource:`, `Command=`, `ModernImage=`
 
 ### 🔄 Publish Pipeline
-- Correct delta-only `RibbonDiffXml` — only changed elements emitted
-- Solution ZIP packaging with `behavior=2` (shell-only) root component — does **not** pull in all entity subcomponents
-- 5-minute import polling with progress beats
-- Post-publish `ribbonmetadatasettoprocess` monitoring — surfaces compile errors that `publishCustomizations` silently swallows
+- Load the exported unmanaged ribbon separately from the merged display model;
+  apply intentional deltas while preserving unrelated and unknown XML.
+- One coherent ribbon-only solution ZIP for the selected workspace, with
+  `behavior=2` entity shells and the original publisher metadata.
+- Detect source/version/publisher conflicts before writing; inspect the actual
+  import result rather than equating 100% progress with success.
+- Targeted publication without a broad fallback, followed by unmanaged and
+  compiled-ribbon read-back verification and a downloadable recovery package.
+- Command-only/rule-only edits, supported reordering, and repeated publications
+  retain independent baselines and refreshed verified XML caches.
 - `Mscrm.OpenRecordItem` override support — emitted as a system-command override when the user defines a JS action on it
 
 ### 🧩 Solution Conflict Drawer
@@ -113,8 +126,9 @@ reimagined with React 18, Fluent UI v9, and live Dataverse integration via
 - Arrow keys — navigate buttons on canvas
 
 ### 💾 Persistence
-- Auto-save ribbon state to `localStorage` keyed by org URL + entity
-- Restore-from-previous-session banner on startup
+- Versioned local drafts keyed by organization, signed-in CRM user, solution and entity.
+- Drafts retain original ribbon baselines; stale source/version/publisher changes
+  prevent blind restoration. Unrelated exported metadata is not stored in a draft.
 - Pane widths, collapsed state, view mode all persisted
 
 ---
@@ -148,6 +162,9 @@ reimagined with React 18, Fluent UI v9, and live Dataverse integration via
 
 Command Bar Studio runs **inside [Power Platform ToolBox](https://www.powerplatformtoolbox.com/)**. It requires the PPTB host to be available — authentication and Dataverse connectivity are provided by the host.
 
+Alternatively, build and install the [native CRM web-resource solution](docs/onpremises.md).
+Both modes use the same editor and preservation-aware publishing pipeline.
+
 1. Install Power Platform ToolBox
 2. Connect to a Dataverse environment
 3. Open Command Bar Studio from the tool list
@@ -179,6 +196,12 @@ npm run typecheck
 # Production build
 npm run build
 
+# Separate native Dynamics 365 CE 9.1 build and package validation
+npm run build:onprem
+npm run test:package:onprem
+# Inspect the actual organization upload limit before choosing --max-file-bytes.
+npm run package:onprem -- --max-file-bytes 8388608 --dry-run
+
 # Preview the production build locally
 npm run preview
 
@@ -191,14 +214,18 @@ npm run test:coverage
 
 ### Standalone vs PPTB-embedded
 
-CBS runs in two modes:
+CBS has two supported hosts:
 
-- **Standalone** (`npm run dev`) — opens in a regular browser tab. Useful for UI
-  iteration. All Dataverse calls fail because `window.dataverseAPI` is absent; the
-  canvas and editors can still be exercised with the restore-from-localStorage path.
 - **Embedded in PPTB** — loads inside the PPTB iframe. The host injects
   `window.dataverseAPI` (typed) and `window.toolboxAPI`. All publish, load, and
   web-resource operations work against the active connection.
+- **Native CRM web resources** — `onprem.html` loads the CRM context and installs
+  a same-origin host adapter before dynamically importing the shared application.
+  No proxy, MSAL application registration or stored credential is required.
+
+`npm run dev` is a Vite development server, not a standalone authentication host.
+Opening its default page outside PPTB without injected host APIs fails startup.
+The native deployed entry must run in the authenticated CRM origin, not localhost.
 
 ---
 
@@ -216,7 +243,7 @@ CBS runs in two modes:
 | **Zustand** | 5 | Global state (ribbons, selection, UI, session) |
 | **fflate** | 0.8 | ZIP compression for solution package + ribbon XML decompression |
 | **@pptb/types** | 1.2.3 | Power Platform ToolBox host API types (`window.dataverseAPI`, `window.toolboxAPI`) |
-| **Vitest** | 3 | Test runner — 148 tests across 8 suites |
+| **Vitest** | 3 | Editor, transport, preservation, publication and UI regression tests |
 
 ---
 
@@ -261,7 +288,7 @@ src/
     monacoCompletions.ts — $LocLabels: / $webresource: / Command= completions
   types/
     ribbon.ts            — Full domain model: RibbonButton, RuleStep (30 kinds), …
-  __tests__/             — 148 Vitest tests
+  __tests__/             — Vitest unit and integration regression tests
   __fixtures__/          — ribbon/account-full.xml, all-rule-kinds.xml, ribbondiff/…
 ```
 

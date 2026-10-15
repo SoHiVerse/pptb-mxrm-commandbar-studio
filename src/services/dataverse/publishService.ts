@@ -1,593 +1,312 @@
-import { zipSync, strToU8 } from "fflate";
-import { generateRibbonDiffXml, wrapInCustomizationsXml, escapeXml } from "@/services/xmlGenerator";
-import { useSessionStore } from "@/store/sessionStore";
+import { generateRibbonDelta, escapeXml } from "@/services/xmlGenerator";
+import { canonicalizeXml, mergeRibbonDiffXml } from "@/services/ribbonMerge";
+import { buildRibbonSolutionPackage } from "@/services/ribbonSolutionPackage";
+import { rebaseWorkspaceSource } from "@/services/ribbonSourceRebase";
+import { hydrateRibbonLabels } from "@/services/hydrateRibbonLabels";
+import { assertMergedRibbon, assertStoredRibbon, inspectImportJob, parseVerifiedXml } from "@/services/ribbonVerification";
+import { assertActiveOrganization, fetchRibbonSource, normalizedOrganizationUrl } from "./ribbonSourceService";
+import { decompressRibbonZip } from "@/utils/decompressRibbonZip";
+import { getRuntimeCapabilities } from "@/hosts/runtime";
 import { useRuntimeLogStore } from "@/store/runtimeLogStore";
-import type {
-	RibbonDefinition,
-	CommandDefinition,
-	EnableRule,
-	DisplayRule,
-	LocLabel,
-} from "@/types/ribbon";
+import type { RibbonDelta, RibbonSolutionPackage, RibbonSourceSnapshot, RibbonWorkspace } from "@/types/workspace";
 
-const dataverseAPI = (window as Window & typeof globalThis).dataverseAPI!;
-
-type ImportStatus = {
-	// PPTB's getImportJobStatus return shape is loosely documented — over
-	// time we've observed both `{ data: { progress: { completed } } }` and
-	// shapes more like the raw Dataverse `importjob` record. Treat all
-	// fields as optional and check multiple signals.
-	data?: {
-		progress?:
-			| {
-					completed?: boolean;
-			  }
-			| number;
-		completedon?: string | null;
-	};
-	progress?: number;
-	completedon?: string | null;
-	statuscode?: number;
-};
-
-function isImportComplete(status: ImportStatus): boolean {
-	// Wrapped shape — `{ data: { progress: { completed: true } } }`
-	const p = status.data?.progress;
-	if (typeof p === "object" && p !== null && (p as { completed?: boolean }).completed === true) {
-		return true;
-	}
-	// Numeric progress at 100 either at root or nested
-	if (typeof status.progress === "number" && status.progress >= 100) return true;
-	if (typeof p === "number" && p >= 100) return true;
-	// `completedon` set anywhere indicates the job finished
-	if (status.completedon) return true;
-	if (status.data?.completedon) return true;
-	// Dataverse importjob statuscode 30 == Succeeded
-	if (status.statuscode === 30) return true;
-	return false;
-}
-
-interface PublishInput {
-	current: RibbonDefinition;
-	baseline: RibbonDefinition;
-	commands: CommandDefinition[];
-	enableRules: EnableRule[];
-	displayRules: DisplayRule[];
-	locLabels: LocLabel[];
-	entityLogicalName: string;
+export interface RibbonPublishInput {
+	organizationUrl: string;
 	solutionUniqueName: string;
-	/** Publisher's `uniquename` (e.g. `mohsinonxrm`). Used for solution.xml's
-	 * `<Publisher><UniqueName>` so the import lands under the right publisher,
-	 * not the default "new" one. */
-	publisherUniqueName: string;
-	/** Publisher's display name (e.g. `MohsinOnXrm`). */
-	publisherName: string;
-	/** Publisher's `customizationprefix` (e.g. `mxrm`). */
-	publisherPrefix: string;
-	solutionVersion: string;
-	/**
-	 * GUIDs of `ribboncustomization` records that the solution declares as
-	 * components (`componenttype = 50`). Required when publishing
-	 * application-ribbon changes — each ID becomes a
-	 * `<RootComponent type="50" id="{guid}" behavior="0" />` entry in the
-	 * generated solution.xml so Dataverse accepts the import. Empty / omitted
-	 * for entity-scope publishes.
-	 */
-	ribbonCustomizationIds?: string[];
-	publishCustomizations?: boolean;
-}
-
-interface PublishXmlInput {
-	entityLogicalNames: string[];
+	entityLogicalName: string;
+	sourceSnapshot: RibbonSourceSnapshot;
+	current: RibbonWorkspace;
+	baseline: RibbonWorkspace;
 	includeApplicationRibbon: boolean;
-	publishDependencies: boolean;
+	solutionVersion?: string;
+	formRibbonScope?: "entity" | "form";
+	strategy?: "targeted" | "allAsync";
 }
 
-interface PublishAllAsyncResult {
-	asyncOperationId: string;
-	statusCode?: number;
+export interface PreparedRibbonPublish extends RibbonSolutionPackage {
+	input: RibbonPublishInput;
+	entityDeltas: RibbonDelta[];
+	applicationDeltas: RibbonDelta[];
+	changesEntity: boolean;
+	changesApplication: boolean;
 }
 
-/**
- * Generates RibbonDiffXml, packages it into a solution ZIP, imports it,
- * polls for completion, then publishes customizations.
- */
-export async function publishRibbon(
-	input: PublishInput,
-	onProgress?: (msg: string) => void,
-): Promise<void> {
-	const logs = useRuntimeLogStore.getState();
-	onProgress?.("Generating RibbonDiffXml…");
-	logs.logInfo("publish", `Generating RibbonDiffXml for ${input.entityLogicalName}.`);
-
-	const ribbonDiffXml = generateRibbonDiffXml({
-		current: input.current,
-		baseline: input.baseline,
-		commands: input.commands,
-		enableRules: input.enableRules,
-		displayRules: input.displayRules,
-		locLabels: input.locLabels,
-		entityLogicalName: input.entityLogicalName,
-		location: input.current.location,
-	});
-
-	const formRibbonScope = useSessionStore.getState().formRibbonScope;
-	const selectedFormId = useSessionStore.getState().selectedFormId;
-	const scope =
-		input.current.location === "Application"
-			? "application"
-			: input.current.location === "Form" && formRibbonScope === "form"
-				? "form"
-				: "entity";
-	const customizationsXml = wrapInCustomizationsXml(
-		ribbonDiffXml,
-		input.entityLogicalName,
-		scope,
-		scope === "form" ? selectedFormId : undefined,
-	);
-
-	// Determine what root components to declare in solution.xml so Dataverse
-	// accepts the customizations we're packaging. Without these, the import
-	// fails with 0x8004803a "component is not declared in the solution file
-	// as a root component".
-	const rootComponents: RootComponentSpec[] = [];
-	if (scope === "entity" && input.entityLogicalName) {
-		// Entity-scope ribbon edit → declare the entity as a SHELL-ONLY root
-		// component (behavior=2 = "Include As Shell Only").
-		//
-		// This was previously behavior=0 ("Include Subcomponents"), which made
-		// the solution claim ownership of EVERY attribute / form / view /
-		// relationship of the entity. On import that drags all of them into the
-		// solution (and any later export carries them) — the reported
-		// "importing the ribbon pulls in all of account's components" bug.
-		//
-		// MS docs (export-prepare-edit-import-ribbon): "For the purpose of
-		// editing table ribbons, you do not have to include required
-		// components." behavior=2 adds just the entity shell so the
-		// RibbonDiffXml in customizations.xml has something to attach to,
-		// without pulling subcomponents.
-		rootComponents.push({
-			type: 1,
-			schemaName: input.entityLogicalName,
-			behavior: 2,
-		});
-	} else if (scope === "form" && input.entityLogicalName && selectedFormId) {
-		// Form-scope ribbon edit → declare the entity parent as a shell
-		// (behavior=2, same reasoning as above) plus the systemform, which is
-		// the actual ribbon carrier and so includes its own content (behavior=0).
-		rootComponents.push({
-			type: 1,
-			schemaName: input.entityLogicalName,
-			behavior: 2,
-		});
-		rootComponents.push({ type: 60, id: selectedFormId, behavior: 0 });
-	}
-	if (scope === "application" && input.ribbonCustomizationIds?.length) {
-		// Application-ribbon publish path. Declare each `ribboncustomization`
-		// component the user's solution owns so Dataverse accepts the import.
-		// The user adds these to their solution via maker.powerapps.com →
-		// Solutions → <solution> → Add existing → Application Ribbons.
-		for (const id of input.ribbonCustomizationIds) {
-			rootComponents.push({ type: 50, id, behavior: 0 });
-		}
-	}
-
-	const solutionXml = generateSolutionXml({
-		uniqueName: input.solutionUniqueName,
-		publisherUniqueName: input.publisherUniqueName,
-		publisherName: input.publisherName,
-		publisherPrefix: input.publisherPrefix,
-		version: input.solutionVersion,
-		rootComponents,
-	});
-
-	onProgress?.("Packaging solution ZIP…");
-	logs.logInfo("publish", "Packaging solution ZIP...");
-	const zipBytes = zipSync({
-		"customizations.xml": strToU8(customizationsXml),
-		"solution.xml": strToU8(solutionXml),
-		"[Content_Types].xml": strToU8(
-			'<?xml version="1.0" encoding="utf-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>',
-		),
-	});
-
-	// Convert to base64
-	let binaryStr = "";
-	for (let i = 0; i < zipBytes.length; i++) {
-		binaryStr += String.fromCharCode(zipBytes[i]);
-	}
-	const base64Zip = btoa(binaryStr);
-
-	onProgress?.("Importing solution…");
-	logs.logInfo("publish", "Importing solution via deploySolution...");
-	// The Dataverse `ImportSolution` action requires the caller to supply a
-	// client-generated `ImportJobId` GUID — without it the request fails with
-	// 0x80048d19 ("One or more parameters of the operation 'ImportSolution'
-	// are missing from the request payload. The missing parameters are:
-	// ImportJobId."). PPTB's `deploySolution` types mark the option as
-	// optional, but Dataverse rejects the call when it's omitted.
-	const importJobId =
-		typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-			? crypto.randomUUID()
-			: // Fallback for runtimes without crypto.randomUUID (very old).
-				`${Date.now()}-${Math.random().toString(16).slice(2)}-${Math.random()
-					.toString(16)
-					.slice(2)}`;
-	logs.logInfo("publish", `Import job id: ${importJobId}`);
-	await dataverseAPI.deploySolution(base64Zip, {
-		importJobId,
-		overwriteUnmanagedCustomizations: true,
-		publishWorkflows: false,
-	});
-
-	onProgress?.("Waiting for import to complete…");
-	logs.logInfo("publish", `Polling import job ${importJobId}...`);
-	// Solution imports — especially ones that touch ribbon metadata — can
-	// legitimately take 2–5 minutes on busy environments. Previously we
-	// capped at 60 × 2s = 120s and reported a timeout even when the maker
-	// portal showed the import had succeeded. Bumped to 150 × 2s = 300s
-	// (5 minutes) and the completion check now accepts multiple signal shapes.
-	const MAX_ATTEMPTS = 150;
-	const POLL_INTERVAL_MS = 2000;
-	let status = (await dataverseAPI.getImportJobStatus(importJobId)) as ImportStatus;
-	let attempts = 0;
-	while (!isImportComplete(status) && attempts < MAX_ATTEMPTS) {
-		await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-		status = (await dataverseAPI.getImportJobStatus(importJobId)) as ImportStatus;
-		attempts++;
-		if (attempts % 15 === 0) {
-			// Surface a progress beat every 30s so the user can see we're
-			// still waiting and not stuck.
-			onProgress?.(`Still importing… (${attempts * 2}s elapsed)`);
-		}
-	}
-
-	if (!isImportComplete(status)) {
-		const elapsed = Math.round((MAX_ATTEMPTS * POLL_INTERVAL_MS) / 1000);
-		logs.logError(
-			"publish",
-			`Solution import did not complete within ${elapsed}s. Check Solutions › History in maker.powerapps.com for job ${importJobId} — the import may still succeed there.`,
-		);
-		throw new Error(
-			`Solution import did not signal completion within ${elapsed} seconds. Check Solutions › History for job ${importJobId}.`,
-		);
-	}
-
-	if (input.publishCustomizations !== false) {
-		onProgress?.("Publishing customizations…");
-		logs.logInfo("publish", "Publishing customizations...");
-		const publishStart = new Date();
-		if (input.entityLogicalName && input.entityLogicalName !== "{!EntityLogicalName}") {
-			await dataverseAPI.publishCustomizations(input.entityLogicalName);
-		} else {
-			await dataverseAPI.publishCustomizations();
-		}
-		// Verify that the ribbon-metadata compile pipeline actually succeeded.
-		// publishCustomizations() returns when the customisation record is
-		// updated, but Dataverse processes the actual ribbon-metadata compilation
-		// asynchronously via the `ribbonmetadatasettoprocess` job queue. A
-		// schema-validation failure there is silent unless we poll for it.
-		await pollRibbonMetadataProcessing(input.entityLogicalName, publishStart, logs, onProgress);
-	}
-
-	onProgress?.("Published successfully!");
-	logs.logInfo("publish", "Publish completed successfully.");
+export interface PublishedRibbonResult {
+	publishedWorkspace: RibbonWorkspace;
+	/** Exact input before verified source-cache rebasing, used to preserve edits made during publication. */
+	submittedWorkspace?: RibbonWorkspace;
+	sourceSnapshot: RibbonSourceSnapshot;
+	backupBase64: string;
+	importJobId: string;
 }
 
-/**
- * Polls the `ribbonmetadatasettoprocess` job-queue table for up to 30 s after
- * `publishCustomizations` returns.  The actual ribbon-metadata compilation runs
- * asynchronously in Dataverse; this is the only way to detect silent compile
- * failures (bad LocLabel refs, schema violations, etc.) that would otherwise
- * let CBS report "Success!" while the user's buttons never appear.
- *
- * The poll is best-effort: if the table is unavailable or no job row appears
- * within the window, we log a note and continue — the prior publish APIs
- * already confirmed the import completed.
- */
-async function pollRibbonMetadataProcessing(
-	entityLogicalName: string,
-	publishStart: Date,
-	logs: ReturnType<typeof useRuntimeLogStore.getState>,
-	onProgress?: (msg: string) => void,
-): Promise<void> {
-	const MAX_POLLS = 15;
-	const POLL_MS = 2000;
-	const entityFilter =
-		entityLogicalName && entityLogicalName !== "{!EntityLogicalName}"
-			? `entityname eq '${entityLogicalName}'`
-			: null;
-	// ISO timestamp (URL-safe, no fractional seconds)
-	const since = publishStart.toISOString().replace(/\.\d+Z$/, "Z");
+export interface PublishOptions {
+	importTimeoutMs?: number;
+	pollIntervalMs?: number;
+	verificationAttempts?: number;
+	verificationIntervalMs?: number;
+	onPrepared?: (prepared: PreparedRibbonPublish) => void;
+}
 
-	// Base query — select only the fields we actually use.
-	const baseQuery =
-		`ribbonmetadatasettoprocess?$select=entityname,processedon,completedon,` +
-		`exceptionmessage,retrycount,status&$orderby=createdon desc&$top=10` +
-		`&$filter=createdon gt ${since}` +
-		(entityFilter ? ` and (${entityFilter})` : "");
+/** The recovery package is retained on every failure after preparation, never automatically imported. */
+export class RibbonPublicationError extends Error {
+	constructor(message: string, readonly backupBase64?: string, readonly importJobId?: string) {
+		super(message);
+		this.name = "RibbonPublicationError";
+	}
+}
 
-	for (let poll = 0; poll < MAX_POLLS; poll++) {
-		await new Promise((r) => setTimeout(r, POLL_MS));
+let publicationInProgress = false;
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+
+function guid(): string {
+	if (typeof crypto?.randomUUID === "function") return crypto.randomUUID();
+	if (typeof crypto?.getRandomValues !== "function") throw new Error("Secure random GUID generation is required before importing.");
+	const bytes = crypto.getRandomValues(new Uint8Array(16));
+	bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
+	const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function hasChanges(delta: RibbonDelta): boolean {
+	if (Object.entries(delta).some(([key, value]) => key !== "xml" && Array.isArray(value) && value.length > 0)) return true;
+	const doc = parseVerifiedXml(delta.xml, "Generated ribbon delta");
+	return Boolean(doc.querySelector("CustomAction, HideCustomAction, CommandDefinition, RuleDefinitions > EnableRules > EnableRule, RuleDefinitions > DisplayRules > DisplayRule, TabDisplayRule, LocLabel, Scaling"));
+}
+
+function validateInput(input: RibbonPublishInput): void {
+	const source = input.sourceSnapshot;
+	if (!source || !source.organizationUrl || normalizedOrganizationUrl(source.organizationUrl) !== normalizedOrganizationUrl(input.organizationUrl) ||
+		source.solutionUniqueName !== input.solutionUniqueName || source.entityLogicalName !== input.entityLogicalName) {
+		throw new Error("The loaded source does not match this organization, solution and entity workspace.");
+	}
+	if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(input.entityLogicalName)) throw new Error("Invalid target entity logical name.");
+	for (const location of ["HomepageGrid", "SubGrid", "Form"] as const) {
+		if (input.current.ribbons[location].entityLogicalName !== input.entityLogicalName || input.baseline.ribbons[location].entityLogicalName !== input.entityLogicalName) {
+			throw new Error("The edited ribbon belongs to a different entity workspace. Reload before publishing.");
+		}
+	}
+	const controlIds = (workspace: RibbonWorkspace, application: boolean): Set<string> => {
+		const locations = application ? ["Application"] as const : ["HomepageGrid", "SubGrid", "Form"] as const;
+		return new Set(locations.flatMap((location) => workspace.ribbons[location].tabs.flatMap((tab) => tab.groups.flatMap((group) => group.buttons.map((button) => button.id)))));
+	};
+	const beforeEntity = controlIds(input.baseline, false), beforeApplication = controlIds(input.baseline, true);
+	const afterEntity = controlIds(input.current, false), afterApplication = controlIds(input.current, true);
+	if ([...afterApplication].some((id) => beforeEntity.has(id) && !beforeApplication.has(id)) ||
+		[...afterEntity].some((id) => beforeApplication.has(id) && !beforeEntity.has(id))) {
+		throw new Error("Transferring existing controls between entity and Application ribbon scopes is not supported by this workspace. Undo the move and author a separately scoped control and command; nothing was imported.");
+	}
+	if (input.formRibbonScope === "form") {
+		throw new Error("Per-systemform ribbon publication is not supported by the entity workspace. Use entity Form ribbon rules instead; no form XML was imported.");
+	}
+	if (input.strategy === "allAsync" && !getRuntimeCapabilities().publishAllXmlAsync) {
+		throw new Error("PublishAllXmlAsync is unavailable in this organization. Use targeted publication.");
+	}
+	if (!input.includeApplicationRibbon && JSON.stringify(input.current.ribbons.Application) !== JSON.stringify(input.baseline.ribbons.Application)) {
+		throw new Error("Application ribbon edits are present. Explicitly include that scope or undo those edits before publishing.");
+	}
+}
+
+function manifestIdentity(xml: string): string {
+	const doc = parseVerifiedXml(xml, "Solution manifest");
+	const publisher = doc.querySelector("SolutionManifest > Publisher");
+	return `${doc.querySelector("SolutionManifest > UniqueName")?.textContent}|${doc.querySelector("SolutionManifest > Version")?.textContent}|${publisher ? canonicalizeXml(new XMLSerializer().serializeToString(publisher)) : ""}`;
+}
+
+function assertNoConflict(loaded: RibbonSourceSnapshot, latest: RibbonSourceSnapshot, includeApplication: boolean): void {
+	if (loaded.userId && loaded.userId !== latest.userId) throw new Error("The signed-in CRM user changed. Reload the workspace before publication.");
+	if (canonicalizeXml(loaded.entityRibbonXml) !== canonicalizeXml(latest.entityRibbonXml) ||
+		(includeApplication && canonicalizeXml(loaded.applicationRibbonXml ?? "<RibbonDiffXml/>") !== canonicalizeXml(latest.applicationRibbonXml ?? "<RibbonDiffXml/>")) ||
+		manifestIdentity(loaded.solutionXml) !== manifestIdentity(latest.solutionXml)) {
+		throw new Error("The server ribbon, solution version or publisher changed after this workspace loaded. Reload and reconcile the conflict; nothing was imported.");
+	}
+}
+
+/** Never acknowledge an edited definition that the selected ribbon scopes did not serialize. */
+function assertAllDefinitionEditsIncluded(input: RibbonPublishInput, deltas: RibbonDelta[]): void {
+	const represented = new Map<string, Set<string>>([
+		["commands", new Set()], ["enableRules", new Set()], ["displayRules", new Set()], ["locLabels", new Set()],
+	]);
+	const selectors = {
+		commands: "CommandDefinitions > CommandDefinition", enableRules: "RuleDefinitions > EnableRules > EnableRule",
+		displayRules: "RuleDefinitions > DisplayRules > DisplayRule", locLabels: "LocLabels > LocLabel",
+	} as const;
+	for (const delta of deltas) {
+		const doc = parseVerifiedXml(delta.xml, "Generated ribbon delta");
+		for (const [kind, selector] of Object.entries(selectors)) {
+			for (const element of Array.from(doc.querySelectorAll(selector))) {
+				const id = element.getAttribute("Id"); if (id) represented.get(kind)!.add(id);
+			}
+		}
+		for (const [kind, ids] of [["commands", delta.removedCommandIds], ["enableRules", delta.removedEnableRuleIds],
+		["displayRules", delta.removedDisplayRuleIds], ["locLabels", delta.removedLocLabelIds]] as const) {
+			for (const id of ids) represented.get(kind)!.add(id);
+		}
+	}
+	for (const kind of Object.keys(selectors) as Array<keyof typeof selectors>) {
+		const before = new Map(input.baseline[kind].map((item) => [item.id, item]));
+		const after = new Map(input.current[kind].map((item) => [item.id, item]));
+		for (const id of new Set([...before.keys(), ...after.keys()])) {
+			const modelJson = (item: unknown) => JSON.stringify(item, (key, value) => key === "sourceXml" ? undefined : value);
+			if (modelJson(before.get(id)) !== modelJson(after.get(id)) && !represented.get(kind)!.has(id)) {
+				throw new Error(`Edited ${kind} definition ${id} is unbound or not included in the selected ribbon scopes. Bind it to a control, include its scope, or undo that edit before publishing.`);
+			}
+		}
+	}
+}
+
+/** Export, compare, and construct a complete ribbon-only package; this function performs no writes. */
+export async function prepareRibbonPublish(input: RibbonPublishInput, onProgress?: (message: string) => void): Promise<PreparedRibbonPublish> {
+	const captured = clone(input);
+	validateInput(captured);
+	await assertActiveOrganization(captured.organizationUrl);
+	onProgress?.("Checking the current unmanaged ribbon and publisher for conflicting changes…");
+	const latest = await fetchRibbonSource(captured.solutionUniqueName, captured.entityLogicalName, captured.organizationUrl);
+	assertNoConflict(captured.sourceSnapshot, latest, captured.includeApplicationRibbon);
+	const generate = (location: "HomepageGrid" | "SubGrid" | "Form" | "Application") => generateRibbonDelta({
+		current: captured.current.ribbons[location], baseline: captured.baseline.ribbons[location],
+		commands: captured.current.commands, displayRules: captured.current.displayRules,
+		enableRules: captured.current.enableRules, locLabels: captured.current.locLabels,
+		baselineDefinitions: captured.baseline,
+		entityLogicalName: location === "Application" ? "{!EntityLogicalName}" : captured.entityLogicalName,
+		location,
+	});
+	const entityDeltas = (["HomepageGrid", "SubGrid", "Form"] as const).map(generate).filter(hasChanges);
+	const applicationDelta = generate("Application");
+	if (!captured.includeApplicationRibbon && hasChanges(applicationDelta)) {
+		throw new Error("Edited definitions also affect the Application ribbon. Explicitly include that scope or use an entity-specific command before publishing.");
+	}
+	const applicationDeltas = captured.includeApplicationRibbon ? [applicationDelta].filter(hasChanges) : [];
+	if (!entityDeltas.length && !applicationDeltas.length) {
+		throw new Error("There are no applicable ribbon changes to publish. Bind new commands or rules to a control before publishing them.");
+	}
+	assertAllDefinitionEditsIncluded(captured, [...entityDeltas, ...applicationDeltas]);
+	const entityRibbonXml = entityDeltas.length ? mergeRibbonDiffXml(latest.entityRibbonXml, entityDeltas) : undefined;
+	const applicationRibbonXml = applicationDeltas.length ? mergeRibbonDiffXml(latest.applicationRibbonXml ?? "<RibbonDiffXml/>", applicationDeltas) : undefined;
+	onProgress?.("Preparing one complete ribbon package and its pre-change recovery package…");
+	const packaged = buildRibbonSolutionPackage(latest, { entityRibbonXml, applicationRibbonXml, solutionVersion: captured.solutionVersion });
+	return { ...packaged, input: captured, entityDeltas, applicationDeltas, changesEntity: entityDeltas.length > 0, changesApplication: applicationDeltas.length > 0 };
+}
+
+/** The documented PublishXml ribbons node targets the application ribbon without publishing everything. */
+export function buildTargetedPublishXml(entityLogicalNames: string[], includeApplicationRibbon: boolean): string {
+	const names = [...new Set(entityLogicalNames)];
+	if (names.some((name) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))) throw new Error("Invalid entity in targeted publication.");
+	if (!names.length && !includeApplicationRibbon) throw new Error("No publication scope was selected.");
+	return `<importexportxml>${names.length ? `<entities>${names.map((name) => `<entity>${escapeXml(name)}</entity>`).join("")}</entities>` : ""}${includeApplicationRibbon ? "<ribbons><ribbon/></ribbons>" : ""}</importexportxml>`;
+}
+
+async function waitForImport(importJobId: string, options: PublishOptions): Promise<void> {
+	const until = Date.now() + (options.importTimeoutMs ?? 300_000);
+	for (; ;) {
+		// Read the raw importjob, including its XML result. PPTB convenience wrappers
+		// may reshape progress and must not hide a failed component result.
+		const status = await window.dataverseAPI.retrieve("importjob", importJobId, ["progress", "completedon", "data"]);
+		if (inspectImportJob(status).complete) return;
+		if (Date.now() >= until) throw new Error(`Import job ${importJobId} did not finish within the verification deadline. Its outcome is uncertain; do not retry automatically.`);
+		await delay(options.pollIntervalMs ?? 1000);
+	}
+}
+
+async function verifyCompiled(prepared: PreparedRibbonPublish, options: PublishOptions, verifiedSource: RibbonSourceSnapshot): Promise<{ entityXml: string; applicationXml?: string }> {
+	const { input } = prepared;
+	const attempts = options.verificationAttempts ?? 4;
+	let lastError: unknown;
+	for (let attempt = 0; attempt < attempts; attempt++) {
 		try {
-			type MetaJob = {
-				entityname?: string;
-				status?: number;
-				completedon?: string | null;
-				processedon?: string | null;
-				exceptionmessage?: string | null;
-				retrycount?: number;
-			};
-			const resp = await dataverseAPI.queryData(baseQuery);
-			const jobs: MetaJob[] = Array.isArray(resp)
-				? resp
-				: Array.isArray(resp?.value)
-					? resp.value
-					: [];
-
-			if (jobs.length === 0) {
-				// No job created yet — Dataverse may still be queueing it.
-				continue;
+			await assertActiveOrganization(input.organizationUrl);
+			// The complete entity workspace is also needed to rebase verified caches
+			// after an application-only update; never synthesize it from editable XML.
+			const result = await window.dataverseAPI.execute({
+				operationName: "RetrieveEntityRibbon", operationType: "function", parameters: {
+					EntityName: input.entityLogicalName, RibbonLocationFilter: "Microsoft.Dynamics.CRM.RibbonLocationFilters'All'",
+				}
+			});
+			if (typeof result.CompressedEntityXml !== "string") throw new Error("Entity ribbon read-back returned no compressed XML.");
+			const entityXml = await decompressRibbonZip(result.CompressedEntityXml);
+				assertMergedRibbon(entityXml, prepared.entityDeltas, "Entity", input.sourceSnapshot.entityRibbonXml, verifiedSource.entityRibbonXml);
+			let applicationXml: string | undefined;
+			if (prepared.changesApplication) {
+				const result = await window.dataverseAPI.execute({ operationName: "RetrieveApplicationRibbon", operationType: "function" });
+				if (typeof result.CompressedApplicationRibbonXml !== "string") throw new Error("Application ribbon read-back returned no compressed XML.");
+				applicationXml = await decompressRibbonZip(result.CompressedApplicationRibbonXml);
+					assertMergedRibbon(applicationXml, prepared.applicationDeltas, "Application", input.sourceSnapshot.applicationRibbonXml ?? "<RibbonDiffXml/>", verifiedSource.applicationRibbonXml ?? "<RibbonDiffXml/>");
 			}
-
-			// Check for failures first (exceptionmessage set).
-			const failedJob = jobs.find((j) => j.exceptionmessage);
-			if (failedJob) {
-				const entity = failedJob.entityname || entityLogicalName;
-				const msg = `Ribbon-metadata compile failed for ${entity}: ` + failedJob.exceptionmessage;
-				logs.logError("publish", msg);
-				onProgress?.(`⚠ ${msg}`);
-				// Throw so BulkPublishModal can surface this as an error rather
-				// than a silent success.
-				throw new Error(msg);
-			}
-
-			// Check for a successfully completed job.
-			const doneJob = jobs.find(
-				(j) => j.completedon || j.processedon || j.status === 4 /* Succeeded */,
-			);
-			if (doneJob) {
-				const entity = doneJob.entityname || entityLogicalName;
-				logs.logInfo("publish", `Ribbon metadata compiled successfully for ${entity}.`);
-				return;
-			}
-
-			if (poll === Math.floor(MAX_POLLS / 2)) {
-				onProgress?.("Waiting for ribbon-metadata compilation…");
-				logs.logInfo("publish", "Ribbon metadata job found; waiting for completion…");
-			}
-		} catch (err) {
-			if (err instanceof Error && err.message.includes("Ribbon-metadata compile failed")) {
-				throw err; // re-throw our own compile-error
-			}
-			// Any other error (permission denied, table not available in org,
-			// network blip) → log and give up gracefully without failing publish.
-			logs.logWarn(
-				"publish",
-				`Could not read ribbonmetadatasettoprocess (${err instanceof Error ? err.message : String(err)}). ` +
-					`Ribbon metadata verification skipped.`,
-			);
-			return;
+			await assertActiveOrganization(input.organizationUrl);
+			return { entityXml, applicationXml };
+		} catch (error) {
+			lastError = error;
+			if (attempt + 1 < attempts) await delay(options.verificationIntervalMs ?? 2000);
 		}
 	}
-
-	// Timed out without seeing a completed job — not necessarily an error;
-	// the compile may still succeed. The publish API calls already confirmed
-	// the import completed.
-	logs.logInfo(
-		"publish",
-		"Ribbon metadata job not observed within 30 s. The publish appears complete — " +
-			"open the entity to confirm your changes are live.",
-	);
+	throw lastError ?? new Error("Compiled ribbon verification did not complete.");
 }
 
-function buildPublishXml(input: PublishXmlInput): string {
-	const entityNodes = input.entityLogicalNames
-		.map((name) => `<entity>${escapeXml(name)}</entity>`)
-		.join("");
-
-	const dependencyNodes = input.publishDependencies
-		? `<nodes/><securityroles/><settings/><workflows/><templates/><plugins/><sdkmessageprocessingsteps/><serviceendpoints/><webresources/>`
-		: `<nodes/>`;
-
-	// PublishXml supports selecting components using ImportExportXml payload.
-	// Application ribbon publication isn't directly targetable by a dedicated node
-	// in this payload, so we rely on global publish fallback when requested.
-	void input.includeApplicationRibbon;
-
-	return `<importexportxml><entities>${entityNodes}</entities>${dependencyNodes}</importexportxml>`;
-}
-
-export async function publishUsingPublishXml(
-	input: PublishXmlInput,
-	onProgress?: (msg: string) => void,
-): Promise<void> {
-	const logs = useRuntimeLogStore.getState();
-	const entities = input.entityLogicalNames.filter(Boolean);
-	if (entities.length === 0) {
-		if (input.includeApplicationRibbon) {
-			onProgress?.("Publishing all customizations...");
-			await dataverseAPI.publishCustomizations();
-		}
-		return;
-	}
-
-	const parameterXml = buildPublishXml({
-		entityLogicalNames: entities,
-		includeApplicationRibbon: input.includeApplicationRibbon,
-		publishDependencies: input.publishDependencies,
-	});
-
-	onProgress?.("Publishing selected components with PublishXml...");
-	logs.logInfo("publish", `PublishXml request for ${entities.length} table(s).`);
-
+/** One coherent import; no per-location overwrites, no automatic rollback, no broad fallback. */
+export async function publishRibbonWorkspace(input: RibbonPublishInput, onProgress?: (message: string) => void, options: PublishOptions = {}): Promise<PublishedRibbonResult> {
+	if (publicationInProgress) throw new Error("Another ribbon publication is already in progress in this window.");
+	publicationInProgress = true;
+	let prepared: PreparedRibbonPublish | undefined;
+	let importJobId: string | undefined;
+	const progress = (message: string) => { useRuntimeLogStore.getState().logInfo("publish", message); onProgress?.(message); };
 	try {
-		await (dataverseAPI as any).execute({
-			operationName: "PublishXml",
-			operationType: "action",
-			parameters: {
-				ParameterXml: parameterXml,
-			},
-		});
-
-		if (input.includeApplicationRibbon) {
-			onProgress?.("Publishing application ribbon...");
-			await dataverseAPI.publishCustomizations();
+		prepared = await prepareRibbonPublish(input, progress);
+		options.onPrepared?.(prepared);
+		await assertActiveOrganization(prepared.input.organizationUrl);
+		importJobId = guid();
+		progress(`Importing the complete ribbon package (job ${importJobId})…`);
+		await window.dataverseAPI.deploySolution(prepared.base64, { importJobId, overwriteUnmanagedCustomizations: true, publishWorkflows: false });
+		await assertActiveOrganization(prepared.input.organizationUrl);
+		progress("Inspecting the import job and component results…");
+		await waitForImport(importJobId, options);
+		await assertActiveOrganization(prepared.input.organizationUrl);
+		if (prepared.input.strategy === "allAsync") {
+			await publishAllAsync(progress);
+		} else {
+			progress("Publishing only the requested entity and application-ribbon scopes…");
+			await window.dataverseAPI.execute({
+				operationName: "PublishXml", operationType: "action", parameters: {
+					ParameterXml: buildTargetedPublishXml(prepared.changesEntity ? [prepared.input.entityLogicalName] : [], prepared.changesApplication),
+				}
+			});
 		}
-
-		logs.logInfo("publish", "PublishXml completed successfully.");
+		progress("Reading back the unmanaged source and compiled ribbon before confirming success…");
+		const verified = await fetchRibbonSource(prepared.input.solutionUniqueName, prepared.input.entityLogicalName, prepared.input.organizationUrl);
+		if (prepared.entityRibbonXml !== undefined) assertStoredRibbon(prepared.entityRibbonXml, verified.entityRibbonXml, "Entity");
+		if (prepared.applicationRibbonXml !== undefined) assertStoredRibbon(prepared.applicationRibbonXml, verified.applicationRibbonXml ?? "<RibbonDiffXml/>", "Application");
+		const beforePublisher = parseVerifiedXml(prepared.input.sourceSnapshot.solutionXml, "Original manifest").querySelector("SolutionManifest > Publisher");
+		const afterPublisher = parseVerifiedXml(verified.solutionXml, "Verified manifest").querySelector("SolutionManifest > Publisher");
+		if (!beforePublisher || !afterPublisher || canonicalizeXml(new XMLSerializer().serializeToString(beforePublisher)) !== canonicalizeXml(new XMLSerializer().serializeToString(afterPublisher))) {
+			throw new Error("Publisher metadata read-back changed unexpectedly. Keep the recovery package and inspect the solution before proceeding.");
+		}
+			const compiled = await verifyCompiled(prepared, options, verified);
+			const publishedWorkspace = hydrateRibbonLabels(rebaseWorkspaceSource(prepared.input.current, compiled.entityXml, compiled.applicationXml), verified);
+		progress("Publication verified: complete unmanaged definition and compiled ribbon read back successfully.");
+		return { publishedWorkspace, submittedWorkspace: prepared.input.current, sourceSnapshot: verified, backupBase64: prepared.backupBase64, importJobId };
 	} catch (error) {
-		logs.logWarn(
-			"publish",
-			`PublishXml failed, falling back to publishCustomizations(): ${error instanceof Error ? error.message : String(error)}`,
-		);
-		for (const entityName of entities) {
-			onProgress?.(`Fallback publish for ${entityName}...`);
-			await dataverseAPI.publishCustomizations(entityName);
-		}
-		if (input.includeApplicationRibbon) {
-			onProgress?.("Fallback publish for application ribbon...");
-			await dataverseAPI.publishCustomizations();
-		}
+		const message = error instanceof Error ? error.message : String(error);
+		useRuntimeLogStore.getState().logError("publish", message);
+		throw new RibbonPublicationError(message, prepared?.backupBase64, importJobId);
+	} finally {
+		publicationInProgress = false;
 	}
 }
 
-export async function publishAllAsync(
-	onProgress?: (msg: string) => void,
-	options?: { pollIntervalMs?: number; timeoutMs?: number },
-): Promise<PublishAllAsyncResult> {
-	const logs = useRuntimeLogStore.getState();
-	const pollIntervalMs = options?.pollIntervalMs ?? 2000;
-	const timeoutMs = options?.timeoutMs ?? 10 * 60 * 1000;
-
-	onProgress?.("Starting asynchronous publish (PublishAllXmlAsync)...");
-	logs.logInfo("publish", "Calling PublishAllXmlAsync action.");
-
-	const response = (await (dataverseAPI as any).execute({
-		operationName: "PublishAllXmlAsync",
-		operationType: "action",
-	})) as { AsyncOperationId?: string };
-
-	const asyncOperationId = response?.AsyncOperationId;
-	if (!asyncOperationId) {
-		throw new Error("PublishAllXmlAsync did not return AsyncOperationId.");
-	}
-
-	logs.logInfo("publish", `PublishAllXmlAsync job id: ${asyncOperationId}`);
-	onProgress?.("Async publish job started. Waiting for completion...");
-
-	const startedAt = Date.now();
-	let attempt = 0;
-	let lastStatusCode: number | undefined;
-
-	while (Date.now() - startedAt < timeoutMs) {
-		attempt += 1;
-		// Use the singular logical name — PPTB pluralizes internally.
-		const job = (await dataverseAPI.retrieve("asyncoperation", asyncOperationId, [
-			"asyncoperationid",
-			"statecode",
-			"statuscode",
-			"name",
-			"message",
-			"friendlymessage",
-			"completedon",
-		])) as {
-			statecode?: number;
-			statuscode?: number;
-			completedon?: string;
-			message?: string;
-			friendlymessage?: string;
-		};
-
-		lastStatusCode = job.statuscode;
-		const isCompleted = job.statecode === 3 || Boolean(job.completedon);
-		if (isCompleted) {
-			if (typeof job.statuscode === "number" && job.statuscode !== 30) {
-				const details = job.friendlymessage || job.message || `statuscode=${job.statuscode}`;
-				throw new Error(`Asynchronous publish failed: ${details}`);
-			}
-			onProgress?.("Asynchronous publish completed successfully.");
-			logs.logInfo("publish", `PublishAllXmlAsync completed in ${attempt} poll(s).`);
-			return { asyncOperationId, statusCode: job.statuscode };
+/** Explicitly selected global operation only. Native hosts must positively expose the action. */
+export async function publishAllAsync(onProgress?: (message: string) => void, options: { pollIntervalMs?: number; timeoutMs?: number } = {}): Promise<{ asyncOperationId: string; statusCode: number }> {
+	if (!getRuntimeCapabilities().publishAllXmlAsync) throw new Error("PublishAllXmlAsync is unavailable in this organization.");
+	onProgress?.("Starting the explicitly selected asynchronous publish-all operation…");
+	const response = await window.dataverseAPI.execute({ operationName: "PublishAllXmlAsync", operationType: "action" });
+	if (typeof response.AsyncOperationId !== "string" || !/^[0-9a-f-]{36}$/i.test(response.AsyncOperationId)) throw new Error("Asynchronous publish returned no valid job ID.");
+	const until = Date.now() + (options.timeoutMs ?? 600_000);
+	while (Date.now() < until) {
+		const job = await window.dataverseAPI.retrieve("asyncoperation", response.AsyncOperationId, ["statecode", "statuscode", "message", "friendlymessage", "completedon"]);
+		if (job.statecode === 3 || job.completedon) {
+			if (job.statuscode !== 30) throw new Error(`Asynchronous publish failed or could not be verified: ${job.friendlymessage || job.message || job.statuscode}`);
+			return { asyncOperationId: response.AsyncOperationId, statusCode: 30 };
 		}
-
-		onProgress?.(`Waiting for async publish job... (poll ${attempt})`);
-		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+		await delay(options.pollIntervalMs ?? 2000);
 	}
-
-	throw new Error(
-		`Asynchronous publish timed out after ${Math.round(timeoutMs / 1000)} seconds (last status: ${lastStatusCode ?? "unknown"}).`,
-	);
-}
-
-interface RootComponentSpec {
-	/** SolutionComponent type code — 1=Entity, 50=Ribbon Customization,
-	 * 60=SystemForm, 61=WebResource, etc. */
-	type: number;
-	/** Entity-type components use `schemaName` (logical name). */
-	schemaName?: string;
-	/** Form / web resource / ribbon-customization components use the GUID `id`. */
-	id?: string;
-	/** 0 = include subcomponents, 1 = don't, 2 = shell only. */
-	behavior: 0 | 1 | 2;
-}
-
-interface SolutionXmlInput {
-	uniqueName: string;
-	publisherUniqueName: string;
-	publisherName: string;
-	publisherPrefix: string;
-	version: string;
-	rootComponents: RootComponentSpec[];
-}
-
-function generateSolutionXml(input: SolutionXmlInput): string {
-	// Fall back to safe placeholders if the publisher fields are missing —
-	// Dataverse will reject the import outright rather than silently routing
-	// to a "new" publisher we don't intend.
-	const pubUnique = input.publisherUniqueName?.trim() || "DefaultPublisher";
-	const pubName = input.publisherName?.trim() || pubUnique;
-	const pubPrefix = input.publisherPrefix?.trim() || "new";
-
-	const rootComponentsXml =
-		input.rootComponents.length === 0
-			? "<RootComponents/>"
-			: `<RootComponents>
-      ${input.rootComponents
-				.map((c) => {
-					const attrs: string[] = [`type="${c.type}"`];
-					if (c.schemaName) attrs.push(`schemaName="${escapeXml(c.schemaName)}"`);
-					if (c.id) attrs.push(`id="{${escapeXml(c.id)}}"`);
-					attrs.push(`behavior="${c.behavior}"`);
-					return `<RootComponent ${attrs.join(" ")} />`;
-				})
-				.join("\n      ")}
-    </RootComponents>`;
-
-	return `<?xml version="1.0" encoding="utf-8"?>
-<ImportExportXml version="9.1.0.0" SolutionPackageVersion="9.1" languagecode="1033" generatedBy="CommandBarStudio">
-  <SolutionManifest>
-    <UniqueName>${escapeXml(input.uniqueName)}</UniqueName>
-    <LocalizedNames>
-      <LocalizedName description="${escapeXml(input.uniqueName)}" languagecode="1033"/>
-    </LocalizedNames>
-    <Descriptions/>
-    <Version>${escapeXml(input.version)}</Version>
-    <Managed>0</Managed>
-    <Publisher>
-      <UniqueName>${escapeXml(pubUnique)}</UniqueName>
-      <LocalizedNames>
-        <LocalizedName description="${escapeXml(pubName)}" languagecode="1033"/>
-      </LocalizedNames>
-      <Descriptions/>
-      <EMailAddress/>
-      <SupportingWebsiteUrl/>
-      <CustomizationPrefix>${escapeXml(pubPrefix)}</CustomizationPrefix>
-      <CustomizationOptionValuePrefix>10000</CustomizationOptionValuePrefix>
-      <Addresses/>
-    </Publisher>
-    ${rootComponentsXml}
-    <MissingDependencies/>
-  </SolutionManifest>
-</ImportExportXml>`;
+	throw new Error("Asynchronous publication exceeded its verification deadline. Check the existing job; do not start another automatically.");
 }

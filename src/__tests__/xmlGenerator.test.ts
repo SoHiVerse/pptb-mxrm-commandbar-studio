@@ -265,7 +265,7 @@ describe("generateRibbonDiffXml — icon attributes", () => {
 // ── generateRibbonDiffXml — HideCustomAction ───────────────────────────────
 
 describe("generateRibbonDiffXml — HideCustomAction", () => {
-	it("generates HideCustomAction for a hidden OOB button not in baseline", () => {
+	it("generates both the new control and HideCustomAction when a hidden button is absent from baseline", () => {
 		const current: RibbonDefinition = {
 			location: "HomepageGrid",
 			entityLogicalName: "account",
@@ -305,7 +305,8 @@ describe("generateRibbonDiffXml — HideCustomAction", () => {
 		expect(xml).toContain(
 			'Location="Mscrm.HomepageGrid.account.MainTab.Actions.Controls.DeleteAccount"',
 		);
-		expect(xml).not.toContain("<Button");
+		// A newly authored control must first exist before a hide action can target it.
+		expect(xml).toContain('<Button Id="Mscrm.HomepageGrid.account.MainTab.Actions.Controls.DeleteAccount"');
 	});
 
 	it("does NOT generate HideCustomAction for a button already hidden in baseline", () => {

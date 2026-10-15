@@ -15,6 +15,7 @@ import type {
 	UrlAction,
 	RibbonAction,
 	EntityProperty,
+	ScalingDefinition,
 } from "@/types/ribbon";
 import { resolveDisplayLabel } from "@/utils/displayLabel";
 import { applyButtonOrigin, heuristicOrigin } from "@/utils/ribbonProvenance";
@@ -50,6 +51,7 @@ export function parseRibbonXml(
 	const enableRules = parseEnableRules(doc);
 	const displayRules = parseDisplayRules(doc);
 	const locLabels = parseLocLabels(doc);
+	const scalingByTab = parseScalings(doc);
 
 	// Build set of customized element IDs from CustomAction elements
 	const customActionIds = new Set<string>();
@@ -81,7 +83,9 @@ export function parseRibbonXml(
 	// OOB/managed/unmanaged comes from ribbonProvenanceService and is overlaid
 	// after load (see applyProvenanceToRibbons).
 	for (const tab of tabs) {
+		tab.label = resolveDisplayLabel(tab.label, locLabels);
 		for (const group of tab.groups) {
+			group.label = resolveDisplayLabel(group.label, locLabels);
 			for (const button of group.buttons) {
 				const inCustomAction = customActionIds.has(button.id);
 				applyButtonOrigin(button, {
@@ -100,7 +104,7 @@ export function parseRibbonXml(
 	}
 
 	return {
-		ribbon: { location, entityLogicalName, tabs },
+		ribbon: { location, entityLogicalName, tabs, ...(Object.keys(scalingByTab).length ? { scalingByTab } : {}) },
 		commands,
 		displayRules,
 		enableRules,
@@ -115,7 +119,10 @@ export function parseRibbonXml(
 function parseTabs(doc: Document): RibbonTab[] {
 	const tabs: RibbonTab[] = [];
 
-	doc.querySelectorAll("Tab").forEach((tabEl) => {
+	// CustomAction > CommandUIDefinition can contain a second <Tab> with
+	// identical Id. Those are declarations, not additional displayed tabs.
+	doc.querySelectorAll("Tabs > Tab").forEach((tabEl) => {
+		if (tabEl.closest("CustomAction, CommandUIDefinition")) return;
 		const id = tabEl.getAttribute("Id") ?? "";
 		if (!id) return;
 		const label = tabEl.getAttribute("Title") ?? id;
@@ -124,17 +131,18 @@ function parseTabs(doc: Document): RibbonTab[] {
 		tabEl.querySelectorAll(":scope > Groups > Group").forEach((groupEl) => {
 			const groupId = groupEl.getAttribute("Id") ?? "";
 			if (!groupId) return;
-			const groupLabel = groupEl.getAttribute("Label") ?? groupId;
+			const groupLabel = groupEl.getAttribute("Title") ?? groupEl.getAttribute("Label") ?? groupId;
 			const groupSeq = parseInt(groupEl.getAttribute("Sequence") ?? "0", 10);
 			const template = groupEl.getAttribute("Template") ?? "";
 
 			const buttons: RibbonButton[] = [];
 			groupEl
-				.querySelectorAll("Button, FlyoutAnchor, SplitButton, TextBox, ComboBox, CheckBox")
+				.querySelectorAll(":scope > Controls > Button, :scope > Controls > FlyoutAnchor, :scope > Controls > SplitButton, :scope > Controls > TextBox, :scope > Controls > ComboBox, :scope > Controls > CheckBox")
 				.forEach((btnEl) => parseButtonElement(btnEl, buttons));
 
 			groups.push({
 				id: groupId,
+				sourceXml: new XMLSerializer().serializeToString(groupEl),
 				label: groupLabel,
 				sequence: groupSeq,
 				template,
@@ -144,6 +152,7 @@ function parseTabs(doc: Document): RibbonTab[] {
 
 		tabs.push({
 			id,
+			sourceXml: new XMLSerializer().serializeToString(tabEl),
 			label,
 			sequence: parseInt(tabEl.getAttribute("Sequence") ?? "0", 10),
 			commandId: tabEl.getAttribute("Command") ?? undefined,
@@ -174,7 +183,7 @@ function applyTabDisplayRules(doc: Document, tabs: RibbonTab[]): void {
 		if (!target) return;
 
 		const rules: TabDisplayRule["rules"] = [];
-		tdr.querySelectorAll("EntityRule").forEach((er) => {
+		tdr.querySelectorAll(":scope > DisplayRules > EntityRule, :scope > EntityRule").forEach((er) => {
 			rules.push({
 				kind: "EntityRule",
 				entityName: er.getAttribute("EntityName") ?? undefined,
@@ -190,11 +199,11 @@ function applyTabDisplayRules(doc: Document, tabs: RibbonTab[]): void {
 					| undefined,
 			});
 		});
-		tdr.querySelectorAll("PageRule").forEach((pr) => {
+		tdr.querySelectorAll(":scope > DisplayRules > PageRule, :scope > PageRule").forEach((pr) => {
 			rules.push({ kind: "PageRule", address: pr.getAttribute("Address") ?? "" });
 		});
 		if (rules.length > 0) {
-			target.tabDisplayRules.push({ tabCommand, rules });
+			target.tabDisplayRules.push({ tabCommand, rules, sourceXml: new XMLSerializer().serializeToString(tdr) });
 		}
 	});
 }
@@ -214,13 +223,17 @@ function parseButtonElement(el: Element, out: RibbonButton[]) {
 	// Keep the raw LabelText token (`$LocLabels:…` / `$Resources:…` / literal);
 	// it is resolved to display text in parseRibbonXml once LocLabels are known.
 	const label = el.getAttribute("LabelText") ?? id;
-	const icon = normalizeFluentIconName(el.getAttribute("ModernImage") ?? undefined);
+	const modernImage = el.getAttribute("ModernImage") ?? undefined;
+	const icon = modernImage?.startsWith("$webresource:") || modernImage?.startsWith("$Resources:")
+		? modernImage
+		: normalizeFluentIconName(modernImage);
 	const sequence = parseInt(el.getAttribute("Sequence") ?? "0", 10);
 	const templateAlias = el.getAttribute("TemplateAlias") ?? "";
 	const commandId = el.getAttribute("Command") ?? "";
 
 	out.push({
 		id,
+		sourceXml: new XMLSerializer().serializeToString(el),
 		label,
 		icon,
 		sequence,
@@ -272,25 +285,27 @@ function parseCommands(doc: Document): CommandDefinition[] {
 
 		const actions: RibbonAction[] = [];
 
-		cmdEl.querySelectorAll("JavaScriptFunction").forEach((fn) => {
-			const library = fn.getAttribute("Library") ?? "";
-			const functionName = fn.getAttribute("FunctionName") ?? "";
-			const params: ActionParameter[] = parseActionParams(fn);
-			const action: JavaScriptAction = { kind: "javascript", library, functionName, params };
-			actions.push(action);
+		// A ribbon command can interleave JS and URL actions; execution order
+		// is significant, so parse them in DOM order rather than by action type.
+		cmdEl.querySelectorAll(":scope > Actions > *").forEach((actionEl) => {
+			if (actionEl.tagName === "JavaScriptFunction") {
+				const library = actionEl.getAttribute("Library") ?? "";
+				const functionName = actionEl.getAttribute("FunctionName") ?? "";
+				const params: ActionParameter[] = parseActionParams(actionEl);
+				const action: JavaScriptAction = { kind: "javascript", library, functionName, params };
+				actions.push(action);
+			} else if (actionEl.tagName === "Url") {
+				const address = actionEl.getAttribute("Address") ?? "";
+				const passParams =
+					actionEl.getAttribute("PassParams") === "1" || actionEl.getAttribute("PassParams") === "true";
+				const winMode = parseInt(actionEl.getAttribute("WinMode") ?? "0", 10) as 0 | 1 | 2;
+				const params: ActionParameter[] = parseActionParams(actionEl);
+				const action: UrlAction = { kind: "url", address, passParams, winMode, params };
+				actions.push(action);
+			}
 		});
 
-		cmdEl.querySelectorAll("Url").forEach((urlEl) => {
-			const address = urlEl.getAttribute("Address") ?? "";
-			const passParams =
-				urlEl.getAttribute("PassParams") === "1" || urlEl.getAttribute("PassParams") === "true";
-			const winMode = parseInt(urlEl.getAttribute("WinMode") ?? "0", 10) as 0 | 1 | 2;
-			const params: ActionParameter[] = parseActionParams(urlEl);
-			const action: UrlAction = { kind: "url", address, passParams, winMode, params };
-			actions.push(action);
-		});
-
-		commands.push({ id, enableRules, displayRules, actions });
+		commands.push({ id, enableRules, displayRules, actions, sourceXml: new XMLSerializer().serializeToString(cmdEl) });
 	});
 
 	return commands;
@@ -314,7 +329,7 @@ function parseActionParams(el: Element): ActionParameter[] {
 				params.push({
 					kind: "BoolParameter",
 					name: c.getAttribute("Name") ?? undefined,
-					value: c.getAttribute("Value") === "true",
+					value: c.getAttribute("Value") === "true" || c.getAttribute("Value") === "1",
 				});
 				break;
 			case "IntParameter":
@@ -350,22 +365,22 @@ function parseActionParams(el: Element): ActionParameter[] {
 
 function parseEnableRules(doc: Document): EnableRule[] {
 	const rules: EnableRule[] = [];
-	doc.querySelectorAll("EnableRules > EnableRule").forEach((rEl) => {
+	doc.querySelectorAll("RuleDefinitions > EnableRules > EnableRule").forEach((rEl) => {
 		const id = rEl.getAttribute("Id") ?? "";
 		if (!id) return;
 		const steps = parseRuleSteps(rEl);
-		rules.push({ id, steps });
+		rules.push({ id, steps, sourceXml: new XMLSerializer().serializeToString(rEl) });
 	});
 	return rules;
 }
 
 function parseDisplayRules(doc: Document): DisplayRule[] {
 	const rules: DisplayRule[] = [];
-	doc.querySelectorAll("DisplayRules > DisplayRule").forEach((rEl) => {
+	doc.querySelectorAll("RuleDefinitions > DisplayRules > DisplayRule").forEach((rEl) => {
 		const id = rEl.getAttribute("Id") ?? "";
 		if (!id) return;
 		const steps = parseRuleSteps(rEl);
-		rules.push({ id, steps });
+		rules.push({ id, steps, sourceXml: new XMLSerializer().serializeToString(rEl) });
 	});
 	return rules;
 }
@@ -671,7 +686,29 @@ function parseLocLabels(doc: Document): LocLabel[] {
 			const description = t.getAttribute("description") ?? "";
 			titles.push({ languageCode: langCode, description });
 		});
-		labels.push({ id, titles });
+		labels.push({ id, titles, sourceXml: new XMLSerializer().serializeToString(lEl) });
 	});
 	return labels;
+}
+
+/** Ribbon XML can express scalings inside tabs or in an outer Scalings block. */
+function parseScalings(doc: Document): Record<string, ScalingDefinition> {
+	const result: Record<string, ScalingDefinition> = {};
+	doc.querySelectorAll("Scaling").forEach((el) => {
+		const tabId = el.getAttribute("TabId") ?? el.closest("Tab")?.getAttribute("Id") ?? "";
+		if (!tabId) return;
+		const steps = (tag: "MaxSize" | "Scale") => [...el.querySelectorAll(`:scope > ${tag}`)].map((step) => ({
+			id: step.getAttribute("Id") ?? "",
+			groupId: step.getAttribute("GroupId") ?? "",
+			size: step.getAttribute("Size") ?? "",
+			sequence: Number(step.getAttribute("Sequence") ?? 0),
+		}));
+		result[tabId] = {
+			tabId,
+			maxSizes: steps("MaxSize"),
+			scales: steps("Scale"),
+			sourceXml: new XMLSerializer().serializeToString(el),
+		};
+	});
+	return result;
 }
